@@ -1037,7 +1037,8 @@ export class ClaudeConverter extends BaseConverter {
                                     
                                     // 获取响应数据
                                     let responseData = block.content;
-                                    
+                                    const imageParts = [];
+
                                     // 的 tool_result_compressor 逻辑
                                     // 处理嵌套的 content 数组（如图片等）
                                     if (Array.isArray(responseData)) {
@@ -1046,11 +1047,24 @@ export class ClaudeConverter extends BaseConverter {
                                             .filter(item => item && item.type === 'text')
                                             .map(item => item.text)
                                             .join('\n');
-                                        responseData = textParts || JSON.stringify(responseData);
+                                        // [FIX tool_result images] 提取 base64 图片块转为 Gemini inlineData part。
+                                        // 原逻辑把整个数组 JSON.stringify 成文本（图片数据变成乱码字符串，
+                                        // 视觉模型因此"看不见"工具返回的截图，客户端表现为静默空回合）。
+                                        for (const item of responseData) {
+                                            if (item && item.type === 'image' && item.source?.type === 'base64' && item.source.data) {
+                                                imageParts.push({
+                                                    inlineData: {
+                                                        mimeType: item.source.media_type || 'image/jpeg',
+                                                        data: item.source.data
+                                                    }
+                                                });
+                                            }
+                                        }
+                                        responseData = textParts || JSON.stringify(responseData.filter(item => !(item && item.type === 'image')));
                                     } else if (typeof responseData !== 'string') {
                                         responseData = JSON.stringify(responseData);
                                     }
-                                    
+
                                     parts.push({
                                         functionResponse: {
                                             name: funcName,
@@ -1061,6 +1075,9 @@ export class ClaudeConverter extends BaseConverter {
                                             }
                                         }
                                     });
+                                    // [FIX tool_result images] 工具返回的截图以 inlineData 跟在 functionResponse 后，
+                                    // 使视觉模型能真正"看到"工具读取的图片
+                                    parts.push(...imageParts);
                                 }
                                 break;
                                 
