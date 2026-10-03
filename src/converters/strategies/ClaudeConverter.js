@@ -876,6 +876,11 @@ export class ClaudeConverter extends BaseConverter {
             contents: []
         };
 
+        // [FIX image cap] 单次请求最多保留最近 N 张工具结果图片（超出则丢弃最早的）。
+        // 客户端会把历史工具结果（含图片）累积重发，一次几十张图会超上游视觉上限，
+        // 模型将静默忽略全部图片；只保留最近几张可保证新读的图始终可见。
+        const toolResultImageBudget = { max: 5, used: 0, dropped: 0, queue: [] };
+
         // 处理系统指令 - 支持数组和字符串格式
         if (claudeRequest.system) {
             if (Array.isArray(claudeRequest.system)) {
@@ -1052,12 +1057,22 @@ export class ClaudeConverter extends BaseConverter {
                                         // 视觉模型因此"看不见"工具返回的截图，客户端表现为静默空回合）。
                                         for (const item of responseData) {
                                             if (item && item.type === 'image' && item.source?.type === 'base64' && item.source.data) {
-                                                imageParts.push({
+                                                // [FIX image cap] 单次请求图片数超过上限时，丢弃最早的图片，
+                                                // 只保留最近的若干张。客户端会把全部历史工具结果（含图片）累积重发，
+                                                // 一次携带几十张图片会超出上游视觉处理上限，模型将静默忽略所有图片。
+                                                if (toolResultImageBudget.used >= toolResultImageBudget.max) {
+                                                    toolResultImageBudget.queue[toolResultImageBudget.queue.length - toolResultImageBudget.max].omitted = true;
+                                                    toolResultImageBudget.dropped++;
+                                                }
+                                                const imagePart = {
                                                     inlineData: {
                                                         mimeType: item.source.media_type || 'image/jpeg',
                                                         data: item.source.data
                                                     }
-                                                });
+                                                };
+                                                imageParts.push(imagePart);
+                                                toolResultImageBudget.queue.push(imagePart);
+                                                toolResultImageBudget.used++;
                                             }
                                         }
                                         responseData = textParts || JSON.stringify(responseData.filter(item => !(item && item.type === 'image')));
@@ -1140,6 +1155,17 @@ export class ClaudeConverter extends BaseConverter {
         
         if (Object.keys(generationConfig).length > 0) {
             geminiRequest.generationConfig = generationConfig;
+        }
+
+        // [FIX image cap] 超出上限的最早图片替换为占位文本（保留请求结构合法，模型可感知图片被省略）
+        if (toolResultImageBudget.dropped > 0) {
+            for (const imagePart of toolResultImageBudget.queue.slice(0, toolResultImageBudget.dropped)) {
+                if (imagePart.omitted) {
+                    delete imagePart.inlineData;
+                    imagePart.text = '[Earlier image omitted: too many images in one request. Re-read the file if you need to see it again.]';
+                }
+            }
+            logger.info(`[Image Cap] Kept the ${toolResultImageBudget.max} most recent tool-result images, omitted ${toolResultImageBudget.dropped} earlier ones.`);
         }
 
         // 处理工具 - 使用 parametersJsonSchema 格式
