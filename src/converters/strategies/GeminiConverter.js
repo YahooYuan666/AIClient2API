@@ -165,6 +165,8 @@ export class GeminiConverter extends BaseConverter {
     constructor() {
         super('gemini');
         this.openAIResponsesStreamStates = new Map();
+        // Gemini -> OpenAI 流式转换的按请求状态（稳定的 chunk id、跨 chunk 递增的 tool_calls index）
+        this.openAIStreamStates = new Map();
     }
 
     /**
@@ -211,7 +213,7 @@ export class GeminiConverter extends BaseConverter {
     convertStreamChunk(chunk, targetProtocol, model, requestId) {
         switch (targetProtocol) {
             case MODEL_PROTOCOL_PREFIX.OPENAI:
-                return this.toOpenAIStreamChunk(chunk, model);
+                return this.toOpenAIStreamChunk(chunk, model, requestId);
             case MODEL_PROTOCOL_PREFIX.CLAUDE:
                 return this.toClaudeStreamChunk(chunk, model);
             case MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES:
@@ -376,11 +378,25 @@ export class GeminiConverter extends BaseConverter {
     /**
      * Gemini流式响应 -> OpenAI流式响应
      */
-    toOpenAIStreamChunk(geminiChunk, model) {
+    toOpenAIStreamChunk(geminiChunk, model, requestId = null) {
         if (!geminiChunk) return null;
 
         const candidate = geminiChunk.candidates?.[0];
         if (!candidate) return null;
+
+        // [FIX] OpenAI 流式协议要求同一次响应内：chunk.id 恒定、tool_calls.index 跨 chunk 递增、
+        // finish_reason 只出现在结束块。Gemini 会把并行 functionCall 拆成多个 chunk 下发，
+        // 若每块都用 index:0 + 新 uuid + finish_reason:'tool_calls'，客户端会把所有调用
+        // 合并进同一个槽位，只剩一个空参数调用（表现为 inputSchema 校验失败）。
+        const stateKey = requestId || 'default';
+        if (!this.openAIStreamStates.has(stateKey)) {
+            this.openAIStreamStates.set(stateKey, {
+                chunkId: `chatcmpl-${uuidv4()}`,
+                toolCallIndex: 0,
+                sawToolCall: false
+            });
+        }
+        const streamState = this.openAIStreamStates.get(stateKey);
 
         let content = '';
         let reasoning_content = '';
@@ -406,7 +422,7 @@ export class GeminiConverter extends BaseConverter {
                 if (part.functionCall) {
                     sawPart = true;
                     toolCalls.push({
-                        index: toolCalls.length,
+                        index: streamState.toolCallIndex++,
                         id: part.functionCall.id || `call_${uuidv4()}`,
                         type: 'function',
                         function: {
@@ -422,6 +438,10 @@ export class GeminiConverter extends BaseConverter {
                     sawPart = true;
                 }
             }
+        }
+
+        if (toolCalls.length > 0) {
+            streamState.sawToolCall = true;
         }
 
         // 处理finishReason
@@ -441,12 +461,10 @@ export class GeminiConverter extends BaseConverter {
                 'MODEL_ARMOR': 'content_filter',
             };
             finishReason = finishReasonMap[candidate.finishReason] || 'stop';
-        }
-
-        // [FIX] 适配 Gemini 流式：Gemini 的最后一条流式消息通常不带 functionCall
-        // 如果当前 chunk 包含工具调用，直接将其标记为 tool_calls
-        if (toolCalls.length > 0) {
-            finishReason = 'tool_calls';
+            // 结束块：本流出现过工具调用时，正常结束要上报 tool_calls（与 common.js 的修正逻辑一致）
+            if (finishReason === 'stop' && streamState.sawToolCall) {
+                finishReason = 'tool_calls';
+            }
         }
 
         // 构建delta对象
@@ -463,7 +481,7 @@ export class GeminiConverter extends BaseConverter {
         }
 
         const chunk = {
-            id: `chatcmpl-${uuidv4()}`,
+            id: streamState.chunkId,
             object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
             model: model,
@@ -473,6 +491,11 @@ export class GeminiConverter extends BaseConverter {
                 finish_reason: finishReason,
             }],
         };
+
+        // 结束块已下发，释放本请求的流状态
+        if (candidate.finishReason) {
+            this.openAIStreamStates.delete(stateKey);
+        }
 
         if(geminiChunk.usageMetadata){
             chunk.usage = {
