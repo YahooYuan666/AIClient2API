@@ -877,6 +877,11 @@ export function createUpstreamResponseFailureError(providerLabel = 'Upstream', f
 function throwIfUpstreamResponseFailed(response, provider, providerLabel = provider) {
     const failure = classifyUpstreamResponseFailure(response, provider);
     if (failure) {
+        // 落盘被拦截的原始终止 chunk：MALFORMED 等终止块在转换/聚合前即被丢弃，
+        // 不记录的话日志里永远看不到模型实际吐出的函数调用内容，无法定位根因。
+        try {
+            logger.error(`[Upstream Raw Failure Chunk] provider=${provider} code=${failure.code} chunk=${JSON.stringify(response).slice(0, 4000)}`);
+        } catch (e) { /* 序列化失败不阻断主错误 */ }
         throw createUpstreamResponseFailureError(providerLabel, failure);
     }
 }
@@ -1066,7 +1071,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // The service returns a stream in its native format (toProvider).
         const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
         requestBody.model = model;
-        const nativeStream = await service.generateContentStream(model, requestBody);
+        let nativeStream = await service.generateContentStream(model, requestBody);
         
         // 如果提供者内部发生了模型回退（如 Antigravity 自动降级），同步更新本地 model 变量
         // 这确保了后续的监控钩子和统计插件记录的是实际使用的模型
@@ -1077,20 +1082,48 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 为每个请求生成唯一 ID，用于在单例 converter 中隔离并发流状态
         const streamRequestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
+        // [FIX mid-stream invisible retry] 可重试的上游终止失败（如 MALFORMED_FUNCTION_CALL：模型吐出空函数调用）
+        // 可能发生在思考内容已流式发给客户端之后。此时 anyDataSent 守卫会放弃重试并把错误帧发给客户端，
+        // 严格解析的客户端（如 ZCode）整轮报 "Model request failed"，只能人工重发。
+        // 改为：对上游做同凭证、同请求体的隐式重试，新响应的 chunk 继续写入同一客户端流——
+        // converter 流状态按 streamRequestId 延续（chunk id 不变、tool_calls index 续接），
+        // Claude 状态机沿用同一 message，客户端表现为前后两段推理 + 正常收尾，整轮不失败。
+        const MID_STREAM_RETRY_MAX = 2;
+        let midStreamRetryCount = 0;
+
+        while (true) {
+        let retrySignal = null;
+        let clientGone = false;
         for await (const nativeChunk of nativeStream) {
             // 检查客户端是否已断开连接
             if (clientDisconnected.value) {
                 logger.info('[Stream] Stopping iteration due to client disconnect');
+                clientGone = true;
                 break;
             }
             
             // 由协议策略识别原生终止失败；必须在转换和写入客户端之前抛出，
             // 才能安全重试且不会把失败伪装成成功的结束帧。
-            throwIfUpstreamResponseFailed(
-                nativeChunk,
-                toProvider,
-                customName ? `${toProvider}/${customName}` : toProvider
-            );
+            try {
+                throwIfUpstreamResponseFailed(
+                    nativeChunk,
+                    toProvider,
+                    customName ? `${toProvider}/${customName}` : toProvider
+                );
+            } catch (classificationError) {
+                // 已发送部分数据时不再直接判死：标记重试信号，交给 while 外层做同请求隐式重试
+                if (
+                    classificationError.isRetryableUpstreamResponseFailure
+                    && anyDataSent
+                    && !clientDisconnected.value
+                    && !hasMessageStop
+                    && midStreamRetryCount < MID_STREAM_RETRY_MAX
+                ) {
+                    retrySignal = classificationError;
+                    break;
+                }
+                throw classificationError;
+            }
 
             // Extract text for logging purposes
             const chunkText = extractResponseText(nativeChunk, toProvider);
@@ -1214,6 +1247,34 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 }
                 // logger.info(`data: ${JSON.stringify(chunk)}\n`);
             }
+        }
+
+        if (clientGone) break;
+
+        // 终止帧缺失兜底：本次尝试结束时客户端从未收到结束帧（上游异常截断/空流），
+        // 直接收尾会让 OpenAI 客户端只见 [DONE] 而缺 finish_reason，同样判流损坏。
+        if (!retrySignal && !hasMessageStop && anyDataSent && !clientDisconnected.value
+            && midStreamRetryCount < MID_STREAM_RETRY_MAX) {
+            retrySignal = {
+                isRetryableUpstreamResponseFailure: true,
+                responseFailureCode: 'TRUNCATED_STREAM',
+                responseFailureLabel: 'stream ended without a terminal frame'
+            };
+        }
+
+        if (!retrySignal) break;
+
+        midStreamRetryCount += 1;
+        logger.warn(`[Stream Retry] ${retrySignal.responseFailureCode || retrySignal.responseFailureLabel || 'retryable failure'} after data already sent to client. Retrying the same upstream request invisibly (${midStreamRetryCount}/${MID_STREAM_RETRY_MAX})...`);
+        const retryDelayMs = CONFIG?.EMPTY_RESPONSE_RETRY_DELAY_MS ?? 500;
+        if (retryDelayMs > 0) {
+            await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        }
+        requestBody.model = model;
+        nativeStream = await service.generateContentStream(model, requestBody);
+        if (requestBody.model && requestBody.model !== model) {
+            model = requestBody.model;
+        }
         }
 
         // 上游流正常结束但一个字节都没发给客户端：这是「静默空响应」，不能算成功。
