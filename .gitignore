@@ -22,3 +22,4 @@ AGENTS.md
 src/plugins-user/
 
 /.codegraph/
+node-guard-state.json
