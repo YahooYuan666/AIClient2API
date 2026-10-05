@@ -338,7 +338,8 @@ async function startServer() {
         logger.info(`  • UI Management Console: http://${CONFIG.HOST}:${CONFIG.SERVER_PORT}/`);
 
         // Auto-open browser to UI (only if host is 0.0.0.0 or 127.0.0.1 and UI_ENABLED is true)
-        if (CONFIG.UI_ENABLED) {
+        // [FIX] honor OPEN_BROWSER config (default: true) so headless/autostart deployments can opt out
+        if (CONFIG.UI_ENABLED && CONFIG.OPEN_BROWSER !== false) {
             try {
                 const open = (await import('open')).default;
                 // 作为子进程启动时，需要更长的延迟确保服务完全就绪
