@@ -977,6 +977,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
     let hasToolCall = false;
     let hasMessageStop = false; // 跟踪是否已经发送过结束标志（message_stop / done）
+    let sawUpstreamFinish = false; // 上游是否已声明终止（原生 chunk 带 finishReason/finish_reason），与客户端协议无关
 
     // [FIX claude stream protocol] Gemini→Claude 流式转换器输出的事件序列不完整：
     // 缺 message_start、缺 thinking/text 块的 content_block_start、缺全部 content_block_stop，
@@ -1094,13 +1095,19 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         while (true) {
         let retrySignal = null;
         let clientGone = false;
-        for await (const nativeChunk of nativeStream) {
-            // 检查客户端是否已断开连接
-            if (clientDisconnected.value) {
-                logger.info('[Stream] Stopping iteration due to client disconnect');
-                clientGone = true;
-                break;
-            }
+            for await (const nativeChunk of nativeStream) {
+                // 检查客户端是否已断开连接
+                if (clientDisconnected.value) {
+                    logger.info('[Stream] Stopping iteration due to client disconnect');
+                    clientGone = true;
+                    break;
+                }
+
+                // 上游原生终止信号（协议无关）：claude 格式的 message_stop 由 finally 收尾合成，
+                // 循环内永远看不到，不能用客户端帧判断本次尝试是否"异常截断"。
+                if (nativeChunk?.candidates?.some(c => c?.finishReason) || nativeChunk?.choices?.some(c => c?.finish_reason)) {
+                    sawUpstreamFinish = true;
+                }
             
             // 由协议策略识别原生终止失败；必须在转换和写入客户端之前抛出，
             // 才能安全重试且不会把失败伪装成成功的结束帧。
@@ -1251,10 +1258,11 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
         if (clientGone) break;
 
-        // 终止帧缺失兜底：本次尝试结束时客户端从未收到结束帧（上游异常截断/空流），
-        // 直接收尾会让 OpenAI 客户端只见 [DONE] 而缺 finish_reason，同样判流损坏。
-        if (!retrySignal && !hasMessageStop && anyDataSent && !clientDisconnected.value
-            && midStreamRetryCount < MID_STREAM_RETRY_MAX) {
+            // 终止帧缺失兜底：上游直到流结束都没声明终止（异常截断/空流）。
+            // 注意用上游原生信号 sawUpstreamFinish 而非客户端帧 hasMessageStop——
+            // claude 格式的终止帧由 finally 合成，循环内不可见，误用会导致每个正常流都被判为截断。
+            if (!retrySignal && !sawUpstreamFinish && anyDataSent && !clientDisconnected.value
+                && midStreamRetryCount < MID_STREAM_RETRY_MAX) {
             retrySignal = {
                 isRetryableUpstreamResponseFailure: true,
                 responseFailureCode: 'TRUNCATED_STREAM',
