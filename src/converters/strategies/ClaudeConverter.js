@@ -1181,6 +1181,16 @@ export class ClaudeConverter extends BaseConverter {
                     return;
                 }
 
+                // Anthropic 服务端搜索工具（如 ZCode「原生联网搜索」以 {type:"web_search_20250305",name:"web_search"} 声明）
+                // → 映射为 Gemini 原生 googleSearch grounding。必须在此拦下，不能落进下面的函数声明分支——
+                // 否则会生成一个没有参数的伪 web_search 函数，模型尝试调用它而客户端无法执行。
+                // Anthropic 的 max_uses/allowed_domains/blocked_domains/user_location 与 Gemini grounding
+                // 参数不同构，先只透传能力本身。
+                if (typeof tool.type === 'string' && tool.type.startsWith('web_search')) {
+                    googleSearchTool = googleSearchTool || {};
+                    return;
+                }
+
                 // 处理 google_search 扩展
                 if (tool.google_search) {
                     googleSearchTool = tool.google_search;
