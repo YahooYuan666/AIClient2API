@@ -109,8 +109,9 @@ function loadState() {
     const s = JSON.parse(fs.readFileSync(STATE, 'utf8'));
     if (!s.blacklist || typeof s.blacklist !== 'object') s.blacklist = {};
     if (!Number.isFinite(s.lastScanPos)) s.lastScanPos = 0;
+    if (typeof s.lastNode !== 'string') s.lastNode = '';
     return s;
-  } catch { return { blacklist: {}, lastScanPos: 0 }; }
+  } catch { return { blacklist: {}, lastScanPos: 0, lastNode: '' }; }
 }
 
 function saveState(state) {
@@ -134,7 +135,10 @@ function scanNewLocationErrors(lastPos) {
       fs.closeSync(fd);
       for (const line of buf.toString('utf8').split('\n')) {
         const m = LOG_TS_RE.exec(line);
-        if (m && line.includes(LOCATION_ERROR)) {
+        // 只认 ERROR 级的真失败。INFO 级的 [Req Original]/[Req Processed] 会把会话历史里
+        // 引用的错误文案原样带回（一次真错误后会永远出现在该会话的每个请求里），
+        // 不加级别过滤会把幻影当新错误，导致节点被疯狂误拉黑（2026-10-07 事故教训）。
+        if (m && line.includes('[ERROR]') && line.includes(LOCATION_ERROR)) {
           const ms = m[3] ? '.' + (m[3] + '00').slice(0, 3) : '';
           const t = new Date(`${m[1]}T${m[2]}${ms}`);
           if (!isNaN(t)) times.push(t);
@@ -158,25 +162,51 @@ async function guardNode(api, state) {
   const [gname, g] = group;
   const current = g.now || '';
 
-  // 1) 增量扫描 A2 日志：新出现的 location 错误归因给当前节点（尽力归因：以扫描时刻组内选中节点为准）
-  const { times, newPos } = scanNewLocationErrors(state.lastScanPos);
-  state.lastScanPos = newPos;
-  if (times.length > 0) {
-    const maxTs = times[times.length - 1];
-    const prev = state.blacklist[current] ? new Date(state.blacklist[current]).getTime() : 0;
-    if (maxTs.getTime() > prev) {
-      state.blacklist[current] = maxTs.toISOString();
-      log(`⚠ 发现 ${times.length} 条 "${LOCATION_ERROR}"（最近 ${maxTs.toLocaleString()}），归因当前节点 "${current}" → 拉黑 ${BAN_DAYS} 天`);
+  // 伪节点/策略组保护：DIRECT、REJECT、内置策略名以及组内嵌套的其它策略组不是真实出口，
+  // 既不能拉黑也不能作为切换目标（2026-10-07 事故：自动选择/故障转移/DIRECT 被逐个拉黑，
+  // 组被一路切到非预期地区）
+  const nonNode = new Set(['DIRECT', 'REJECT', 'GLOBAL', '自动选择', '故障转移']);
+  for (const [name, v] of Object.entries(map)) {
+    if (['Selector', 'URLTest', 'Fallback', 'LoadBalance'].includes(v.type)) nonNode.add(name);
+  }
+
+  // 用户手动选择了策略组（如「自动选择」）时不干预——那是用户自己的路由意图
+  if (nonNode.has(current)) {
+    const { newPos } = scanNewLocationErrors(state.lastScanPos);
+    state.lastScanPos = newPos;
+    state.lastNode = current;
+    log(`group "${gname}" on policy selection "${current}" — leave it alone`);
+    return;
+  }
+
+  // 1) 增量扫描 A2 日志：新出现的 location 错误归因给当前节点。
+  //    归因保护：两次扫描之间节点发生过切换 → 无法确认错误由哪个节点产生 → 本轮不归因只推进扫描位
+  const prevNode = state.lastNode;
+  if (prevNode && prevNode !== current) {
+    const { newPos } = scanNewLocationErrors(state.lastScanPos);
+    state.lastScanPos = newPos;
+    log(`node changed "${prevNode}" -> "${current}" during scan interval; skip error attribution this cycle`);
+  } else {
+    const { times, newPos } = scanNewLocationErrors(state.lastScanPos);
+    state.lastScanPos = newPos;
+    if (times.length > 0) {
+      const maxTs = times[times.length - 1];
+      const prev = state.blacklist[current] ? new Date(state.blacklist[current]).getTime() : 0;
+      if (maxTs.getTime() > prev) {
+        state.blacklist[current] = maxTs.toISOString();
+        log(`⚠ 发现 ${times.length} 条 ERROR 级 "${LOCATION_ERROR}"（最近 ${maxTs.toLocaleString()}），归因当前节点 "${current}" → 拉黑 ${BAN_DAYS} 天`);
+      }
     }
   }
+  state.lastNode = current;
 
   // 2) 清理过期黑名单（15 天后允许再次尝试）
   for (const [n, t] of Object.entries(state.blacklist)) {
     if (!banActive(t)) { delete state.blacklist[n]; log(`node "${n}" 的 ${BAN_DAYS} 天黑名单已过期，重新进入合格范围`); }
   }
 
-  // 3) 合格范围 = 组内节点 - 受限地区名 - 未过期黑名单
-  const eligible = (g.all || []).filter(n => !RESTRICTED.test(n) && !banActive(state.blacklist[n]));
+  // 3) 合格范围 = 组内节点 - 受限地区名 - 未过期黑名单 - 伪节点/策略组
+  const eligible = (g.all || []).filter(n => !nonNode.has(n) && !RESTRICTED.test(n) && !banActive(state.blacklist[n]));
 
   // 4) 当前节点不合格（受限地区名 / 被风控拉黑）→ 切到下一个合格节点
   const currentBad = RESTRICTED.test(current) || banActive(state.blacklist[current]);
