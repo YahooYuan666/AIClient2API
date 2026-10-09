@@ -56,6 +56,26 @@ const ANTIGRAVITY_STREAM_IDLE_TIMEOUT_MS = 300000;
 const ANTIGRAVITY_RAW_FALLBACK_MAX_LINES = 20000;
 const ANTIGRAVITY_ERROR_BODY_MAX_BYTES = 1024 * 1024;
 
+/**
+ * 429 是否属于「额度耗尽」而不是瞬时限流。
+ * Google 额度用尽的响应体带 status:"RESOURCE_EXHAUSTED"（reason:"rateLimitExceeded"），
+ * 且不给 Retry-After——对同一个账号重试只会空等。瞬时限流（如带 Retry-After，
+ * 或无此标记的普通 429）不在此列，仍走原有退避重试。
+ * @param {Error} error
+ * @returns {boolean}
+ */
+function isQuotaExhaustedError(error) {
+    // 流式路径把上游错误体按原文字符串挂在 response.data 上（见 streamApi 的
+    // upstreamError.response），非流式路径则是已解析的对象，两种都要认。
+    let data = error?.response?.data;
+    if (typeof data === 'string') {
+        try { data = JSON.parse(data); } catch { return false; }
+    }
+    if (!data || typeof data !== 'object') return false;
+    const entries = Array.isArray(data) ? data : [data];
+    return entries.some(entry => entry?.error?.status === 'RESOURCE_EXHAUSTED');
+}
+
 // 获取 Antigravity 模型列表
 const ANTIGRAVITY_MODELS = getProviderModels(MODEL_PROVIDER.ANTIGRAVITY);
 
@@ -1483,6 +1503,17 @@ export class AntigravityApiService {
                     logger.warn(`[Antigravity API] Received 429 with Retry-After: ${retryAfter}ms. Throwing to upper layer.`);
                     throw error;
                 }
+                // 额度耗尽（RESOURCE_EXHAUSTED）重试同一个账号毫无意义：上游不给 Retry-After，
+                // 本地按指数退避空转只会让客户端干等数分钟后才看到失败。直接上抛，
+                // 由上层决定切换其他凭证；没有其他凭证时错误会立刻返回客户端。
+                // 不计入凭证错误次数——这是配额问题，不是凭证损坏。
+                if (isQuotaExhaustedError(error)) {
+                    await normalizeProviderErrorMessage(error, { status: 429, context: 'callApi' });
+                    logger.warn('[Antigravity API] Quota exhausted (429 RESOURCE_EXHAUSTED). Not retrying the same credential; throwing to upper layer.');
+                    error.shouldSwitchCredential = true;
+                    error.skipErrorCount = true;
+                    throw error;
+                }
                 if (baseURLIndex + 1 < this.baseURLs.length) {
                     logger.info(`[Antigravity API] Rate limited on ${baseURL}. Trying next base URL...`);
                     return this.callApi(method, body, isRetry, retryCount, baseURLIndex + 1);
@@ -1644,6 +1675,17 @@ export class AntigravityApiService {
                 if (retryAfter !== null) {
                     await normalizeProviderErrorMessage(error, { status: 429, context: 'stream' });
                     logger.warn(`[Antigravity API] Received 429 with Retry-After: ${retryAfter}ms during stream. Throwing to upper layer.`);
+                    throw error;
+                }
+                // 额度耗尽（RESOURCE_EXHAUSTED）重试同一个账号毫无意义：上游不给 Retry-After，
+                // 本地按指数退避空转只会让客户端干等数分钟后才看到失败。直接上抛，
+                // 由上层决定切换其他凭证；没有其他凭证时错误会立刻返回客户端。
+                // 不计入凭证错误次数——这是配额问题，不是凭证损坏。
+                if (isQuotaExhaustedError(error)) {
+                    await normalizeProviderErrorMessage(error, { status: 429, context: 'stream' });
+                    logger.warn('[Antigravity API] Quota exhausted (429 RESOURCE_EXHAUSTED) during stream. Not retrying the same credential; throwing to upper layer.');
+                    error.shouldSwitchCredential = true;
+                    error.skipErrorCount = true;
                     throw error;
                 }
                 if (baseURLIndex + 1 < this.baseURLs.length) {
