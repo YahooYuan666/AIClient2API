@@ -166,6 +166,36 @@ describe('Gemini → Claude stream protocol (#718)', () => {
         expect(starts(out).some(x => x.data.content_block.type === 'tool_use' && !x.data.content_block.name)).toBe(false);
     });
 
+    test('interleaved Responses tool arguments stay on their own calls', async () => {
+        const native = [
+            { type: 'response.created', response: { id: 'resp-1', model: 'gpt' } },
+            { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call-a', name: 'get_city' } },
+            { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', call_id: 'call-b', name: 'get_country' } },
+            { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'call-a', delta: '{"city":"' },
+            { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'call-b', delta: '{"country":"' },
+            { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'call-a', delta: 'Paris"}' },
+            { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'call-b', delta: 'France"}' },
+            { type: 'response.function_call_arguments.done', output_index: 0 },
+            { type: 'response.function_call_arguments.done', output_index: 1 },
+            { type: 'response.completed', response: { output: [], usage: { input_tokens: 1, output_tokens: 1 } } }
+        ];
+        const { out } = await run({
+            nativeChunks: native,
+            fromProvider: 'claude',
+            toProvider: 'grok-cli-oauth'
+        });
+        const tools = starts(out).filter(x => x.data.content_block.type === 'tool_use');
+        expect(tools.map(x => x.data.content_block.id)).toEqual(['call-a', 'call-b']);
+        expect(tools.map(x => x.data.content_block.name)).toEqual(['get_city', 'get_country']);
+        const args = index => deltas(out)
+            .filter(x => x.data.index === index && x.data.delta?.type === 'input_json_delta')
+            .map(x => x.data.delta.partial_json)
+            .join('');
+        expect(JSON.parse(args(tools[0].data.index))).toEqual({ city: 'Paris' });
+        expect(JSON.parse(args(tools[1].data.index))).toEqual({ country: 'France' });
+        expect(stops(out)).toHaveLength(2);
+    });
+
     test('empty first stream then recursive retry emits one complete shared Claude sequence', async () => {
         const first = { generateContentStream: jest.fn(() => streamOf([])) };
         mockRetryService.generateContentStream.mockImplementation(() => streamOf([
