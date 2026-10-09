@@ -12,7 +12,6 @@ fetch_system_prompt.txt
 input_system_prompt.txt
 token-store.json
 usage-cache.json
-configs/pwd
 *_oauth_creds.json
 *-auth-token.json
 *_codex-*.json
@@ -23,3 +22,4 @@ AGENTS.md
 src/plugins-user/
 
 /.codegraph/
+configs/node-guard-state.json
