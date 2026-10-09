@@ -986,6 +986,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         started: false,
         nextIndex: 0,
         current: null,
+        open: new Map(),
+        indexesUnreliable: false,
         sawToolUse: false,
         stopReasonSeen: false,
         messageStopSent: false
@@ -1003,11 +1005,19 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             return;
         }
 
-        const closeCurrent = () => {
-            if (claudeStreamState.current) {
-                out.push({ type: 'content_block_stop', index: claudeStreamState.current.index });
-                claudeStreamState.current = null;
+        const closeBlock = block => {
+            if (!block) return;
+            out.push({ type: 'content_block_stop', index: block.index });
+            claudeStreamState.open.delete(block.sourceIndex);
+            if (claudeStreamState.current === block) claudeStreamState.current = null;
+        };
+        const closeCurrent = () => closeBlock(claudeStreamState.current);
+        const closeAllOpen = () => {
+            for (const block of claudeStreamState.open.values()) {
+                out.push({ type: 'content_block_stop', index: block.index });
             }
+            claudeStreamState.open.clear();
+            claudeStreamState.current = null;
         };
         const ensureMessageStart = () => {
             if (claudeStreamState.started) return;
@@ -1051,17 +1061,30 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         ensureMessageStart();
 
         if (eventType === 'content_block_start') {
-            closeCurrent();
             const blockType = chunk.content_block?.type || 'text';
+            const suppliedIndex = Number.isInteger(chunk.index) ? chunk.index : null;
+            const sourceKnown = suppliedIndex !== null && !claudeStreamState.open.has(suppliedIndex);
+            const sourceIndex = sourceKnown ? suppliedIndex : claudeStreamState.nextIndex;
+            // Gemini repeats index 0 for every call. Once an index is reused it is not an identity,
+            // so later argument fragments follow the call that just opened.
+            if (suppliedIndex !== null && claudeStreamState.open.has(suppliedIndex)) {
+                claudeStreamState.indexesUnreliable = true;
+            }
+            if (!isClaudeToolBlock(blockType)) closeCurrent();
+
             const index = claudeStreamState.nextIndex++;
             const block = chunk.content_block ? { ...chunk.content_block } : { type: blockType, text: '' };
             if (blockType === 'thinking' && typeof block.thinking !== 'string') block.thinking = '';
             if (blockType === 'text' && typeof block.text !== 'string') block.text = '';
-            claudeStreamState.current = {
+            const opened = {
                 index,
+                sourceIndex,
                 type: blockType,
-                toolId: isClaudeToolBlock(blockType) ? block.id || null : null
+                toolId: isClaudeToolBlock(blockType) ? block.id || null : null,
+                ownsSourceIndex: sourceKnown
             };
+            claudeStreamState.open.set(sourceIndex, opened);
+            claudeStreamState.current = opened;
             if (isClaudeToolBlock(blockType)) claudeStreamState.sawToolUse = true;
             out.push({ ...chunk, index, content_block: block });
             return;
@@ -1070,8 +1093,18 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (eventType === 'content_block_delta') {
             const deltaType = chunk.delta?.type;
             if (deltaType === 'input_json_delta') {
-                // Never invent an empty-name tool. A legal server tool/use must have opened a block first.
-                if (claudeStreamState.current && isClaudeToolBlock(claudeStreamState.current.type)) {
+                const addressed = Number.isInteger(chunk.index) ? claudeStreamState.open.get(chunk.index) : null;
+                // A source index identifies a call only while indexes are unique.
+                // Gemini repeats 0, so only its first call claims 0; later calls follow current.
+                const target = !claudeStreamState.indexesUnreliable
+                    && addressed?.ownsSourceIndex
+                    && isClaudeToolBlock(addressed.type)
+                    ? addressed
+                    : null;
+                if (target) {
+                    claudeStreamState.current = target;
+                    out.push({ ...chunk, index: target.index });
+                } else if (claudeStreamState.current && isClaudeToolBlock(claudeStreamState.current.type)) {
                     out.push({ ...chunk, index: claudeStreamState.current.index });
                 } else {
                     closeCurrent();
@@ -1095,20 +1128,22 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
 
         if (eventType === 'content_block_stop') {
-            // Converter-provided indexes are often all 0; only close the block we actually opened.
-            closeCurrent();
+            const addressed = Number.isInteger(chunk.index) ? claudeStreamState.open.get(chunk.index) : null;
+            if (!claudeStreamState.indexesUnreliable && addressed?.ownsSourceIndex) closeBlock(addressed);
+            else closeCurrent();
             return;
         }
 
         if (eventType === 'message_delta') {
-            closeCurrent();
+            closeAllOpen();
             if (chunk.delta?.stop_reason) claudeStreamState.stopReasonSeen = true;
             out.push(chunk);
             return;
         }
 
         if (eventType === 'message_stop') {
-            closeCurrent();
+            if (claudeStreamState.open.size === 0) closeCurrent();
+            closeAllOpen();
             if (!claudeStreamState.stopReasonSeen) {
                 out.push({
                     type: 'message_delta',
