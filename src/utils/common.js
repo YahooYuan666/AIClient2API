@@ -916,6 +916,11 @@ export function createUpstreamResponseFailureError(providerLabel = 'Upstream', f
 function throwIfUpstreamResponseFailed(response, provider, providerLabel = provider) {
     const failure = classifyUpstreamResponseFailure(response, provider);
     if (failure) {
+        // 落盘被拦截的原始终止 chunk：MALFORMED 等终止块在转换前即被丢弃，
+        // 不记录的话日志里看不到模型实际吐出的内容，无法定位根因。
+        try {
+            logger.error(`[Upstream Raw Failure Chunk] provider=${provider} code=${failure.code} chunk=${JSON.stringify(response).slice(0, 4000)}`);
+        } catch (e) { /* 序列化失败不阻断主错误 */ }
         throw createUpstreamResponseFailureError(providerLabel, failure);
     }
 }
@@ -1220,6 +1225,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
         out.push(chunk);
     };
+    let sawUpstreamFinish = false; // 上游是否已声明终止，与客户端协议无关
 
     try {
         // fs.writeFile('request'+Date.now()+'.json', JSON.stringify(requestBody));
@@ -1229,7 +1235,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 仍需知道它负责的是转换后的 Claude 流，才能用共享状态完成收尾。
         shouldNormalizeClaudeStream = clientProtocol === MODEL_PROTOCOL_PREFIX.CLAUDE && needsConversion;
         requestBody.model = model;
-        const nativeStream = await service.generateContentStream(model, requestBody);
+        let nativeStream = await service.generateContentStream(model, requestBody);
         
         // 如果提供者内部发生了模型回退（如 Antigravity 自动降级），同步更新本地 model 变量
         // 这确保了后续的监控钩子和统计插件记录的是实际使用的模型
@@ -1240,20 +1246,54 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 为每个请求生成唯一 ID，用于在单例 converter 中隔离并发流状态。
         streamRequestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
+        // 可重试的上游终止失败（如 MALFORMED_FUNCTION_CALL）可能发生在内容已经发给客户端之后。
+        // 此时直接判失败，严格客户端只能人工重发。改为同一凭证、同一请求再要一次，
+        // 新内容接在已经发出的内容后面，streamRequestId 不变，客户端看到的仍是一轮。
+        const MID_STREAM_RETRY_MAX = 2;
+        let midStreamRetryCount = 0;
+
+        while (true) {
+        let retrySignal = null;
+        let clientGone = false;
         for await (const nativeChunk of nativeStream) {
             // 检查客户端是否已断开连接
             if (clientDisconnected.value) {
                 logger.info('[Stream] Stopping iteration due to client disconnect');
+                clientGone = true;
                 break;
+            }
+
+            // 转换后的 Claude 终止帧由 finally 合成，循环内看不到；
+            // 原生 Claude 的 message_stop 本身就是上游终止。
+            if (
+                nativeChunk?.candidates?.some(c => c?.finishReason)
+                || nativeChunk?.choices?.some(c => c?.finish_reason)
+                || (!needsConversion && nativeChunk?.type === 'message_stop')
+            ) {
+                sawUpstreamFinish = true;
             }
             
             // 由协议策略识别原生终止失败；必须在转换和写入客户端之前抛出，
             // 才能安全重试且不会把失败伪装成成功的结束帧。
-            throwIfUpstreamResponseFailed(
-                nativeChunk,
-                toProvider,
-                customName ? `${toProvider}/${customName}` : toProvider
-            );
+            try {
+                throwIfUpstreamResponseFailed(
+                    nativeChunk,
+                    toProvider,
+                    customName ? `${toProvider}/${customName}` : toProvider
+                );
+            } catch (classificationError) {
+                if (
+                    classificationError.isRetryableUpstreamResponseFailure
+                    && anyDataSent
+                    && !clientDisconnected.value
+                    && !hasMessageStop
+                    && midStreamRetryCount < MID_STREAM_RETRY_MAX
+                ) {
+                    retrySignal = classificationError;
+                    break;
+                }
+                throw classificationError;
+            }
 
             // Extract text for logging purposes
             const chunkText = extractResponseText(nativeChunk, toProvider);
@@ -1375,6 +1415,34 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 }
                 // logger.info(`data: ${JSON.stringify(chunk)}\n`);
             }
+        }
+
+        if (clientGone) break;
+
+        // 上游直到流结束都没声明终止。不能用客户端帧判断：
+        // 转换后的 Claude 终止帧由 finally 合成，循环内不可见。
+        if (!retrySignal && !sawUpstreamFinish && anyDataSent && !clientDisconnected.value
+            && midStreamRetryCount < MID_STREAM_RETRY_MAX) {
+            retrySignal = {
+                isRetryableUpstreamResponseFailure: true,
+                responseFailureCode: 'TRUNCATED_STREAM',
+                responseFailureLabel: 'stream ended without a terminal frame'
+            };
+        }
+
+        if (!retrySignal) break;
+
+        midStreamRetryCount += 1;
+        logger.warn(`[Stream Retry] ${retrySignal.responseFailureCode || retrySignal.responseFailureLabel || 'retryable failure'} after data already sent to client. Retrying the same upstream request invisibly (${midStreamRetryCount}/${MID_STREAM_RETRY_MAX})...`);
+        const retryDelayMs = CONFIG?.EMPTY_RESPONSE_RETRY_DELAY_MS ?? 500;
+        if (retryDelayMs > 0) {
+            await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        }
+        requestBody.model = model;
+        nativeStream = await service.generateContentStream(model, requestBody);
+        if (requestBody.model && requestBody.model !== model) {
+            model = requestBody.model;
+        }
         }
 
         // 上游流正常结束但一个字节都没发给客户端：这是「静默空响应」，不能算成功。
