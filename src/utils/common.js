@@ -328,28 +328,42 @@ function formatQuotaRecovery(recoveryTime) {
 
 /**
  * 额度耗尽时不要空等后再选回同一个 uuid。
- * 池里还有别的健康账号才允许切换一次；否则立刻把恢复时间返回给客户端。
+ * 当前类型、已配置的 fallback、以及它们支持的模型都要看；没有替代才立刻返回。
  */
-function hasAlternateHealthyCredential(providerPoolManager, providerType, currentUuid) {
-    const providers = providerPoolManager?.providerStatus?.[providerType];
-    if (!Array.isArray(providers)) return false;
-    return providers.some(provider => {
-        const config = provider?.config;
-        return config
-            && config.uuid
-            && config.uuid !== currentUuid
-            && config.isHealthy !== false
-            && config.isDisabled !== true;
+function hasAlternateHealthyCredential(providerPoolManager, providerType, currentUuid, requestedModel) {
+    const configuredFallbacks = providerPoolManager?.fallbackChain?.[providerType];
+    const providerTypes = [providerType, ...(Array.isArray(configuredFallbacks) ? configuredFallbacks : [])];
+    const seen = new Set();
+    return providerTypes.some(type => {
+        if (!type || seen.has(type)) return false;
+        seen.add(type);
+        const providers = providerPoolManager?.providerStatus?.[type];
+        if (!Array.isArray(providers)) return false;
+        return providers.some(provider => {
+            const config = provider?.config;
+            if (!config?.uuid || config.uuid === currentUuid || config.isHealthy === false || config.isDisabled === true) {
+                return false;
+            }
+            const supportedModels = config.supportedModels || config.models;
+            if (requestedModel && Array.isArray(supportedModels) && supportedModels.length > 0) {
+                return supportedModels.includes(requestedModel);
+            }
+            if (requestedModel && Array.isArray(config.notSupportedModels)) {
+                return !config.notSupportedModels.includes(requestedModel);
+            }
+            return true;
+        });
     });
 }
 
 function applyCredentialCooldown(error, config, providerPoolManager, providerType, pooluuid, logPrefix) {
+    const quotaExhausted = error?.quotaExhausted === true;
     const quotaRecoveryTime = error?.quotaRecoveryTime instanceof Date && !Number.isNaN(error.quotaRecoveryTime.getTime())
         ? error.quotaRecoveryTime
         : null;
     const rateLimitRecoveryTime = quotaRecoveryTime || getRateLimitCooldownRecoveryTime(error, config);
     if (!rateLimitRecoveryTime || !providerPoolManager || !pooluuid) {
-        return { recoveryTime: quotaRecoveryTime, credentialMarkedUnhealthy: false };
+        return { recoveryTime: quotaRecoveryTime, credentialMarkedUnhealthy: false, quotaExhausted };
     }
 
     const reason = quotaRecoveryTime
@@ -362,7 +376,7 @@ function applyCredentialCooldown(error, config, providerPoolManager, providerTyp
     if (quotaRecoveryTime && !String(error.message || '').includes('Quota is expected to recover')) {
         error.message = `${error.message || 'Quota exhausted.'}${formatQuotaRecovery(quotaRecoveryTime)}`;
     }
-    return { recoveryTime: rateLimitRecoveryTime, credentialMarkedUnhealthy: true, quotaExhausted: Boolean(quotaRecoveryTime) };
+    return { recoveryTime: rateLimitRecoveryTime, credentialMarkedUnhealthy: true, quotaExhausted };
 }
 
 // ==================== API 常量 ====================
@@ -1293,7 +1307,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
 
         // 额度已经耗尽且池里没有第二个健康账号时，随机等待只会重新选中同一个 uuid。
-        const quotaHasAlternate = !cooldown.quotaExhausted || hasAlternateHealthyCredential(providerPoolManager, toProvider, pooluuid);
+        const quotaHasAlternate = !cooldown.quotaExhausted || hasAlternateHealthyCredential(providerPoolManager, toProvider, pooluuid, model);
         if (cooldown.quotaExhausted && !quotaHasAlternate) {
             logger.info(`[Stream Retry] Quota exhausted for ${toProvider} (${pooluuid}) and no alternate credential exists. Returning immediately.`);
         }
@@ -1310,7 +1324,10 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 // 动态导入以避免循环依赖
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
                 // 使用 acquireSlot: true 以占用新凭证的并发插槽
-                const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true });
+                const result = await getApiServiceWithFallback(CONFIG, model, {
+                    acquireSlot: true,
+                    excludeUuids: cooldown.quotaExhausted && pooluuid ? [pooluuid] : []
+                });
                 
                 if (result && result.service) {
                     logger.info(`[Stream Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -1556,7 +1573,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
             credentialMarkedUnhealthy = true; // 触发下面的重试逻辑
         }
 
-        const quotaHasAlternate = !cooldown.quotaExhausted || hasAlternateHealthyCredential(providerPoolManager, toProvider, pooluuid);
+        const quotaHasAlternate = !cooldown.quotaExhausted || hasAlternateHealthyCredential(providerPoolManager, toProvider, pooluuid, model);
         if (cooldown.quotaExhausted && !quotaHasAlternate) {
             logger.info(`[Unary Retry] Quota exhausted for ${toProvider} (${pooluuid}) and no alternate credential exists. Returning immediately.`);
         }
@@ -1572,7 +1589,10 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                 // 动态导入以避免循环依赖
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
                 // 使用 acquireSlot: true 以占用新凭证的并发插槽
-                const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true });
+                const result = await getApiServiceWithFallback(CONFIG, model, {
+                    acquireSlot: true,
+                    excludeUuids: cooldown.quotaExhausted && pooluuid ? [pooluuid] : []
+                });
                 
                 if (result && result.service) {
                     logger.info(`[Unary Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);

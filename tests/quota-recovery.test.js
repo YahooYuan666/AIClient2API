@@ -43,11 +43,12 @@ function poolWith(accounts, currentUuid) {
     };
 }
 
-function quotaError({ body, asString = false, recovery } = {}) {
+function quotaError({ body, asString = false, recovery, exhausted = true } = {}) {
     const error = new Error('Upstream API Error (Status 429)');
     error.status = 429;
     error.shouldSwitchCredential = true;
     error.skipErrorCount = true;
+    error.quotaExhausted = exhausted;
     error.response = { status: 429, data: asString ? JSON.stringify(body) : body };
     if (recovery) error.quotaRecoveryTime = recovery;
     return error;
@@ -177,6 +178,35 @@ describe('quota exhaustion does not spin on the same account', () => {
         await runStream(error, manager, 0);
         expect(manager.markProviderUnhealthyWithRecoveryTime).not.toHaveBeenCalled();
         expect(manager.markProviderUnhealthy).toHaveBeenCalled();
+    });
+
+    test('one account without a parseable recovery time is not selected again', async () => {
+        const manager = poolWith([{ uuid: 'only' }], 'only');
+        const { elapsed } = await runStream(quotaError({ body: exhaustedBody() }), manager);
+        expect(elapsed).toBeLessThan(1500);
+        expect(mockGetApiServiceWithFallback).not.toHaveBeenCalled();
+        expect(manager.markProviderHealthy).not.toHaveBeenCalled();
+    });
+
+    test('a configured healthy fallback provider is used when the current pool is exhausted', async () => {
+        const manager = poolWith([{ uuid: 'only' }], 'only');
+        manager.fallbackChain = { 'gemini-antigravity': ['gemini-cli-oauth'] };
+        manager.providerStatus['gemini-cli-oauth'] = [{
+            uuid: 'backup',
+            config: { uuid: 'backup', isHealthy: true }
+        }];
+        const backup = failingService(Object.assign(new Error('backup answered'), { status: 400, response: { status: 400, data: {} } }));
+        mockGetApiServiceWithFallback.mockResolvedValueOnce({
+            service: backup,
+            uuid: 'backup',
+            actualProviderType: 'gemini-cli-oauth',
+            actualModel: 'gemini-3.8-flash-high',
+            serviceConfig: {}
+        });
+        await runStream(quotaError({ body: exhaustedBody() }), manager);
+        expect(mockGetApiServiceWithFallback).toHaveBeenCalledTimes(1);
+        expect(mockGetApiServiceWithFallback.mock.calls[0][2].excludeUuids).toEqual(['only']);
+        expect(backup.generateContentStream).toHaveBeenCalledTimes(1);
     });
 
     test('unary requests with one account also return immediately', async () => {
