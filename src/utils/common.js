@@ -328,28 +328,42 @@ function formatQuotaRecovery(recoveryTime) {
 
 /**
  * 额度耗尽时不要空等后再选回同一个 uuid。
- * 池里还有别的健康账号才允许切换一次；否则立刻把恢复时间返回给客户端。
+ * 当前类型、已配置的 fallback、以及它们支持的模型都要看；没有替代才立刻返回。
  */
-function hasAlternateHealthyCredential(providerPoolManager, providerType, currentUuid) {
-    const providers = providerPoolManager?.providerStatus?.[providerType];
-    if (!Array.isArray(providers)) return false;
-    return providers.some(provider => {
-        const config = provider?.config;
-        return config
-            && config.uuid
-            && config.uuid !== currentUuid
-            && config.isHealthy !== false
-            && config.isDisabled !== true;
+function hasAlternateHealthyCredential(providerPoolManager, providerType, currentUuid, requestedModel) {
+    const configuredFallbacks = providerPoolManager?.fallbackChain?.[providerType];
+    const providerTypes = [providerType, ...(Array.isArray(configuredFallbacks) ? configuredFallbacks : [])];
+    const seen = new Set();
+    return providerTypes.some(type => {
+        if (!type || seen.has(type)) return false;
+        seen.add(type);
+        const providers = providerPoolManager?.providerStatus?.[type];
+        if (!Array.isArray(providers)) return false;
+        return providers.some(provider => {
+            const config = provider?.config;
+            if (!config?.uuid || config.uuid === currentUuid || config.isHealthy === false || config.isDisabled === true) {
+                return false;
+            }
+            const supportedModels = config.supportedModels || config.models;
+            if (requestedModel && Array.isArray(supportedModels) && supportedModels.length > 0) {
+                return supportedModels.includes(requestedModel);
+            }
+            if (requestedModel && Array.isArray(config.notSupportedModels)) {
+                return !config.notSupportedModels.includes(requestedModel);
+            }
+            return true;
+        });
     });
 }
 
 function applyCredentialCooldown(error, config, providerPoolManager, providerType, pooluuid, logPrefix) {
+    const quotaExhausted = error?.quotaExhausted === true;
     const quotaRecoveryTime = error?.quotaRecoveryTime instanceof Date && !Number.isNaN(error.quotaRecoveryTime.getTime())
         ? error.quotaRecoveryTime
         : null;
     const rateLimitRecoveryTime = quotaRecoveryTime || getRateLimitCooldownRecoveryTime(error, config);
     if (!rateLimitRecoveryTime || !providerPoolManager || !pooluuid) {
-        return { recoveryTime: quotaRecoveryTime, credentialMarkedUnhealthy: false };
+        return { recoveryTime: quotaRecoveryTime, credentialMarkedUnhealthy: false, quotaExhausted };
     }
 
     const reason = quotaRecoveryTime
@@ -362,7 +376,7 @@ function applyCredentialCooldown(error, config, providerPoolManager, providerTyp
     if (quotaRecoveryTime && !String(error.message || '').includes('Quota is expected to recover')) {
         error.message = `${error.message || 'Quota exhausted.'}${formatQuotaRecovery(quotaRecoveryTime)}`;
     }
-    return { recoveryTime: rateLimitRecoveryTime, credentialMarkedUnhealthy: true, quotaExhausted: Boolean(quotaRecoveryTime) };
+    return { recoveryTime: rateLimitRecoveryTime, credentialMarkedUnhealthy: true, quotaExhausted };
 }
 
 // ==================== API 常量 ====================
@@ -1022,6 +1036,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
     let hasToolCall = false;
     let hasMessageStop = false; // 跟踪是否已经发送过结束标志（message_stop / done）
+    let streamAttemptFinished = false;
     // finally 必须能访问这两个值：客户端 close、上游 throw 和无终止块 EOF 都要释放状态。
     // generateContentStream 初始化失败前 streamRequestId 仍为空，安全跳过清理。
     let needsConversion = false;
@@ -1231,12 +1246,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 为每个请求生成唯一 ID，用于在单例 converter 中隔离并发流状态。
         streamRequestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
-        // [FIX mid-stream invisible retry] 可重试的上游终止失败（如 MALFORMED_FUNCTION_CALL：模型吐出空函数调用）
-        // 可能发生在思考内容已流式发给客户端之后。此时 anyDataSent 守卫会放弃重试并把错误帧发给客户端，
-        // 严格解析的客户端（如 ZCode）整轮报 "Model request failed"，只能人工重发。
-        // 改为：对上游做同凭证、同请求体的隐式重试，新响应的 chunk 继续写入同一客户端流——
-        // converter 流状态按 streamRequestId 延续（chunk id 不变、tool_calls index 续接），
-        // Claude 状态机沿用同一 message，客户端表现为前后两段推理 + 正常收尾，整轮不失败。
+        // 还没向客户端写出内容时，同一个请求可以再要一次。
+        // 已经写出一半后不能把整段请求重放并拼接：工具参数会变成非法 JSON，文本也会重复前缀。
         const MID_STREAM_RETRY_MAX = 2;
         let midStreamRetryCount = 0;
 
@@ -1251,17 +1262,14 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     break;
                 }
 
-                // 上游原生终止信号（协议无关）。转换后的 Claude 终止帧由 finally 合成，
-                // 循环内看不到，不能用客户端帧判断；但原生 Claude 流的 message_stop 就是上游终止。
-                if (
-                    nativeChunk?.candidates?.some(c => c?.finishReason)
+                // 终止信号先记在本次尝试上。失败分类通过后才算真正完成，
+                // 不能让上一轮的完成状态把这一轮的截断当成成功。
+                const nativeTerminal = nativeChunk?.candidates?.some(c => c?.finishReason)
                     || nativeChunk?.choices?.some(c => c?.finish_reason)
                     || nativeChunk?.type === 'response.completed'
                     || nativeChunk?.type === 'response.incomplete'
-                    || (!needsConversion && nativeChunk?.type === 'message_stop')
-                ) {
-                    sawUpstreamFinish = true;
-                }
+                    || nativeChunk?.type === 'message_stop';
+                if (nativeTerminal) streamAttemptFinished = true;
             
             // 由协议策略识别原生终止失败；必须在转换和写入客户端之前抛出，
             // 才能安全重试且不会把失败伪装成成功的结束帧。
@@ -1272,12 +1280,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     customName ? `${toProvider}/${customName}` : toProvider
                 );
             } catch (classificationError) {
-                // 已发送部分数据时不再直接判死：标记重试信号，交给 while 外层做同请求隐式重试
+                streamAttemptFinished = false;
+                // 客户端还没收到内容时，同请求再要一次。已经收到内容后必须明确失败。
                 if (
                     classificationError.isRetryableUpstreamResponseFailure
-                    && anyDataSent
+                    && !anyDataSent
                     && !clientDisconnected.value
-                    && !hasMessageStop
                     && midStreamRetryCount < MID_STREAM_RETRY_MAX
                 ) {
                     retrySignal = classificationError;
@@ -1410,17 +1418,24 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
         if (clientGone) break;
 
-            // 终止帧缺失兜底：上游直到流结束都没声明终止（异常截断/空流）。
-            // 注意用上游原生信号 sawUpstreamFinish 而非客户端帧 hasMessageStop——
-            // claude 格式的终止帧由 finally 合成，循环内不可见，误用会导致每个正常流都被判为截断。
-            if (!retrySignal && !sawUpstreamFinish && anyDataSent && !clientDisconnected.value
-                && midStreamRetryCount < MID_STREAM_RETRY_MAX) {
+            sawUpstreamFinish = streamAttemptFinished;
+            streamAttemptFinished = false;
+            // 本次尝试没有原生终止信号。客户端还没收到内容时可以再要一次；
+            // 已经收到内容，或者重试次数用完，都按截断失败返回，不能补一个成功结束。
+            if (!retrySignal && !sawUpstreamFinish && !clientDisconnected.value
+                && !anyDataSent && midStreamRetryCount < MID_STREAM_RETRY_MAX) {
             retrySignal = {
                 isRetryableUpstreamResponseFailure: true,
                 responseFailureCode: 'TRUNCATED_STREAM',
                 responseFailureLabel: 'stream ended without a terminal frame'
             };
         }
+            if (!retrySignal && !sawUpstreamFinish && !clientDisconnected.value) {
+                const truncated = new Error(`[${customName ? `${toProvider}/${customName}` : toProvider}] Upstream stream ended before a terminal frame.`);
+                truncated.status = 502;
+                truncated.responseFailureCode = 'TRUNCATED_STREAM';
+                throw truncated;
+            }
 
         if (!retrySignal) break;
 
@@ -1567,7 +1582,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
 
         // 额度已经耗尽且池里没有第二个健康账号时，随机等待只会重新选中同一个 uuid。
-        const quotaHasAlternate = !cooldown.quotaExhausted || hasAlternateHealthyCredential(providerPoolManager, toProvider, pooluuid);
+        const quotaHasAlternate = !cooldown.quotaExhausted || hasAlternateHealthyCredential(providerPoolManager, toProvider, pooluuid, model);
         if (cooldown.quotaExhausted && !quotaHasAlternate) {
             logger.info(`[Stream Retry] Quota exhausted for ${toProvider} (${pooluuid}) and no alternate credential exists. Returning immediately.`);
         }
@@ -1584,7 +1599,10 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 // 动态导入以避免循环依赖
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
                 // 使用 acquireSlot: true 以占用新凭证的并发插槽
-                const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true });
+                const result = await getApiServiceWithFallback(CONFIG, model, {
+                    acquireSlot: true,
+                    excludeUuids: cooldown.quotaExhausted && pooluuid ? [pooluuid] : []
+                });
                 
                 if (result && result.service) {
                     logger.info(`[Stream Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -1848,7 +1866,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
             credentialMarkedUnhealthy = true; // 触发下面的重试逻辑
         }
 
-        const quotaHasAlternate = !cooldown.quotaExhausted || hasAlternateHealthyCredential(providerPoolManager, toProvider, pooluuid);
+        const quotaHasAlternate = !cooldown.quotaExhausted || hasAlternateHealthyCredential(providerPoolManager, toProvider, pooluuid, model);
         if (cooldown.quotaExhausted && !quotaHasAlternate) {
             logger.info(`[Unary Retry] Quota exhausted for ${toProvider} (${pooluuid}) and no alternate credential exists. Returning immediately.`);
         }
@@ -1864,7 +1882,10 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                 // 动态导入以避免循环依赖
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
                 // 使用 acquireSlot: true 以占用新凭证的并发插槽
-                const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true });
+                const result = await getApiServiceWithFallback(CONFIG, model, {
+                    acquireSlot: true,
+                    excludeUuids: cooldown.quotaExhausted && pooluuid ? [pooluuid] : []
+                });
                 
                 if (result && result.service) {
                     logger.info(`[Unary Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);

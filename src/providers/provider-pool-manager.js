@@ -1042,8 +1042,9 @@ export class ProviderPoolManager {
         // 提前计算池中最小序列号，避免在排序算法中重复 O(N) 计算
         const minSeq = Math.min(...availableProviders.map(p => p.config._lastSelectionSeq || 0));
 
+        const excludedUuids = new Set(Array.isArray(options.excludeUuids) ? options.excludeUuids : []);
         let availableAndHealthyProviders = availableProviders.filter(p =>
-            p.config.isHealthy && !p.config.isDisabled && !p.config.needsRefresh
+            p.config.isHealthy && !p.config.isDisabled && !p.config.needsRefresh && !excludedUuids.has(p.config.uuid)
         );
 
         // 如果指定了模型，则排除不支持该模型的提供商

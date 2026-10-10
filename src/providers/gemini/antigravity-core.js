@@ -1508,23 +1508,22 @@ export class AntigravityApiService {
             }
 
             if (status === 429) {
-                const retryAfter = getRetryAfterMs(error);
-                if (retryAfter !== null) {
-                    await normalizeProviderErrorMessage(error, { status: 429, context: 'callApi' });
-                    logger.warn(`[Antigravity API] Received 429 with Retry-After: ${retryAfter}ms. Throwing to upper layer.`);
-                    throw error;
-                }
-                // 额度耗尽（RESOURCE_EXHAUSTED）重试同一个账号毫无意义：上游不给 Retry-After，
-                // 本地按指数退避空转只会让客户端干等数分钟后才看到失败。直接上抛，
-                // 由上层决定切换其他凭证；没有其他凭证时错误会立刻返回客户端。
-                // 不计入凭证错误次数——这是配额问题，不是凭证损坏。
+                // 额度耗尽必须先于普通 Retry-After。getRetryAfterMs 也会解析错误体里的
+                // quotaResetDelay，放在前面会把带恢复时间的 RESOURCE_EXHAUSTED 提前截走。
                 if (isQuotaExhaustedError(error)) {
                     await normalizeProviderErrorMessage(error, { status: 429, context: 'callApi' });
                     const recoveryTime = getQuotaRecoveryTime(error);
                     if (recoveryTime) error.quotaRecoveryTime = recoveryTime;
+                    error.quotaExhausted = true;
                     logger.warn(`[Antigravity API] Quota exhausted (429 RESOURCE_EXHAUSTED). Not retrying the same credential; throwing to upper layer.${recoveryTime ? ` Recovery at ${recoveryTime.toISOString()}.` : ''}`);
                     error.shouldSwitchCredential = true;
                     error.skipErrorCount = true;
+                    throw error;
+                }
+                const retryAfter = getRetryAfterMs(error);
+                if (retryAfter !== null) {
+                    await normalizeProviderErrorMessage(error, { status: 429, context: 'callApi' });
+                    logger.warn(`[Antigravity API] Received 429 with Retry-After: ${retryAfter}ms. Throwing to upper layer.`);
                     throw error;
                 }
                 if (baseURLIndex + 1 < this.baseURLs.length) {
@@ -1684,23 +1683,22 @@ export class AntigravityApiService {
             }
 
             if (status === 429) {
-                const retryAfter = getRetryAfterMs(error);
-                if (retryAfter !== null) {
-                    await normalizeProviderErrorMessage(error, { status: 429, context: 'stream' });
-                    logger.warn(`[Antigravity API] Received 429 with Retry-After: ${retryAfter}ms during stream. Throwing to upper layer.`);
-                    throw error;
-                }
-                // 额度耗尽（RESOURCE_EXHAUSTED）重试同一个账号毫无意义：上游不给 Retry-After，
-                // 本地按指数退避空转只会让客户端干等数分钟后才看到失败。直接上抛，
-                // 由上层决定切换其他凭证；没有其他凭证时错误会立刻返回客户端。
-                // 不计入凭证错误次数——这是配额问题，不是凭证损坏。
+                // 额度耗尽必须先于普通 Retry-After。getRetryAfterMs 也会解析错误体里的
+                // quotaResetDelay，放在前面会把带恢复时间的 RESOURCE_EXHAUSTED 提前截走。
                 if (isQuotaExhaustedError(error)) {
                     await normalizeProviderErrorMessage(error, { status: 429, context: 'stream' });
                     const recoveryTime = getQuotaRecoveryTime(error);
                     if (recoveryTime) error.quotaRecoveryTime = recoveryTime;
+                    error.quotaExhausted = true;
                     logger.warn(`[Antigravity API] Quota exhausted (429 RESOURCE_EXHAUSTED) during stream. Not retrying the same credential; throwing to upper layer.${recoveryTime ? ` Recovery at ${recoveryTime.toISOString()}.` : ''}`);
                     error.shouldSwitchCredential = true;
                     error.skipErrorCount = true;
+                    throw error;
+                }
+                const retryAfter = getRetryAfterMs(error);
+                if (retryAfter !== null) {
+                    await normalizeProviderErrorMessage(error, { status: 429, context: 'stream' });
+                    logger.warn(`[Antigravity API] Received 429 with Retry-After: ${retryAfter}ms during stream. Throwing to upper layer.`);
                     throw error;
                 }
                 if (baseURLIndex + 1 < this.baseURLs.length) {
