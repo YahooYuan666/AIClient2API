@@ -979,6 +979,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     let hasToolCall = false;
     let hasMessageStop = false; // 跟踪是否已经发送过结束标志（message_stop / done）
     let sawUpstreamFinish = false; // 上游是否已声明终止，与客户端协议无关
+    let streamAttemptFinished = false;
 
     try {
         // fs.writeFile('request'+Date.now()+'.json', JSON.stringify(requestBody));
@@ -996,9 +997,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 为每个请求生成唯一 ID，用于在单例 converter 中隔离并发流状态
         const streamRequestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
-        // 可重试的上游终止失败（如 MALFORMED_FUNCTION_CALL）可能发生在内容已经发给客户端之后。
-        // 此时直接判失败，严格客户端只能人工重发。改为同一凭证、同一请求再要一次，
-        // 新内容接在已经发出的内容后面，streamRequestId 不变，客户端看到的仍是一轮。
+        // 还没向客户端写出内容时，同一个请求可以再要一次。
+        // 已经写出一半后不能把整段请求重放并拼接：工具参数会变成非法 JSON，文本也会重复前缀。
         const MID_STREAM_RETRY_MAX = 2;
         let midStreamRetryCount = 0;
 
@@ -1013,15 +1013,14 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 break;
             }
 
-            // 转换后的 Claude 终止帧由 finally 合成，循环内看不到；
-            // 原生 Claude 的 message_stop 本身就是上游终止。
-            if (
-                nativeChunk?.candidates?.some(c => c?.finishReason)
+            // 终止信号先记在本次尝试上。失败分类通过后才算真正完成，
+            // 不能让上一轮的完成状态把这一轮的截断当成成功。
+            const nativeTerminal = nativeChunk?.candidates?.some(c => c?.finishReason)
                 || nativeChunk?.choices?.some(c => c?.finish_reason)
-                || (!needsConversion && nativeChunk?.type === 'message_stop')
-            ) {
-                sawUpstreamFinish = true;
-            }
+                || nativeChunk?.type === 'response.completed'
+                || nativeChunk?.type === 'response.incomplete'
+                || nativeChunk?.type === 'message_stop';
+            if (nativeTerminal) streamAttemptFinished = true;
             
             // 由协议策略识别原生终止失败；必须在转换和写入客户端之前抛出，
             // 才能安全重试且不会把失败伪装成成功的结束帧。
@@ -1032,11 +1031,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     customName ? `${toProvider}/${customName}` : toProvider
                 );
             } catch (classificationError) {
+                streamAttemptFinished = false;
+                // 客户端还没收到内容时，同请求再要一次。已经收到内容后必须明确失败。
                 if (
                     classificationError.isRetryableUpstreamResponseFailure
-                    && anyDataSent
+                    && !anyDataSent
                     && !clientDisconnected.value
-                    && !hasMessageStop
                     && midStreamRetryCount < MID_STREAM_RETRY_MAX
                 ) {
                     retrySignal = classificationError;
@@ -1162,15 +1162,23 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
         if (clientGone) break;
 
-        // 上游直到流结束都没声明终止。不能用客户端帧判断：
-        // 转换后的 Claude 终止帧由 finally 合成，循环内不可见。
-        if (!retrySignal && !sawUpstreamFinish && anyDataSent && !clientDisconnected.value
-            && midStreamRetryCount < MID_STREAM_RETRY_MAX) {
+        sawUpstreamFinish = streamAttemptFinished;
+        streamAttemptFinished = false;
+        // 本次尝试没有原生终止信号。客户端还没收到内容时可以再要一次；
+        // 已经收到内容，或者重试次数用完，都按截断失败返回，不能补一个成功结束。
+        if (!retrySignal && !sawUpstreamFinish && !clientDisconnected.value
+            && !anyDataSent && midStreamRetryCount < MID_STREAM_RETRY_MAX) {
             retrySignal = {
                 isRetryableUpstreamResponseFailure: true,
                 responseFailureCode: 'TRUNCATED_STREAM',
                 responseFailureLabel: 'stream ended without a terminal frame'
             };
+        }
+        if (!retrySignal && !sawUpstreamFinish && !clientDisconnected.value) {
+            const truncated = new Error(`[${customName ? `${toProvider}/${customName}` : toProvider}] Upstream stream ended before a terminal frame.`);
+            truncated.status = 502;
+            truncated.responseFailureCode = 'TRUNCATED_STREAM';
+            throw truncated;
         }
 
         if (!retrySignal) break;

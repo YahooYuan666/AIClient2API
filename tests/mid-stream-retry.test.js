@@ -19,38 +19,6 @@ function response() {
     return res;
 }
 
-function chunk(text, finishReason) {
-    return {
-        candidates: [{
-            content: { role: 'model', parts: [{ text }] },
-            ...(finishReason ? { finishReason } : {})
-        }]
-    };
-}
-
-function malformedChunk() {
-    return {
-        candidates: [{
-            finishReason: 'MALFORMED_FUNCTION_CALL',
-            content: { role: 'model', parts: [{ functionCall: { name: '', args: {} } }] }
-        }]
-    };
-}
-
-function serviceWith(attempts) {
-    let call = 0;
-    return {
-        calls: () => call,
-        generateContentStream: jest.fn(() => {
-            const items = attempts[call] || [];
-            call += 1;
-            return (async function* () {
-                for (const item of items) yield item;
-            })();
-        })
-    };
-}
-
 function pool() {
     return {
         markProviderHealthy: jest.fn(),
@@ -60,49 +28,86 @@ function pool() {
     };
 }
 
-async function run(service, fromProvider = 'openai', toProvider = 'gemini-antigravity', model = 'gemini-3.8-flash-high') {
-    const res = response();
-    await handleStreamRequest(
-        res, service, model, {}, fromProvider, toProvider,
-        'none', null, pool(), 'only', null,
-        { CONFIG: { EMPTY_RESPONSE_RETRY_DELAY_MS: 1 }, maxRetries: 0 }
-    );
-    return res.write.mock.calls.flat().join('');
+function serviceWith(attempts) {
+    let call = 0;
+    return {
+        calls: () => call,
+        generateContentStream: jest.fn(() => {
+            const items = attempts[Math.min(call, attempts.length - 1)] || [];
+            call += 1;
+            return (async function* () {
+                for (const item of items) yield item;
+            })();
+        })
+    };
 }
 
-describe('mid-stream invisible retry', () => {
-    test('a malformed call after partial text retries the same request and keeps one response', async () => {
-        const service = serviceWith([
-            [chunk('partial answer'), malformedChunk()],
-            [chunk(' finished', 'STOP')]
-        ]);
-        const body = await run(service);
-        expect(service.calls()).toBe(2);
-        expect(body).toContain('partial answer');
-        expect(body).toContain(' finished');
-        expect(body.match(/data: \[DONE\]/g)).toHaveLength(1);
-        expect(body).not.toContain('error');
-    });
+async function run(service, fromProvider = 'openai', toProvider = 'gemini-antigravity', model = 'gemini-3.8-flash-high') {
+    const res = response();
+    const manager = pool();
+    await handleStreamRequest(
+        res, service, model, {}, fromProvider, toProvider,
+        'none', null, manager, 'only', null,
+        { CONFIG: { EMPTY_RESPONSE_RETRY_DELAY_MS: 1 }, maxRetries: 0 }
+    );
+    return { body: res.write.mock.calls.flat().join(''), calls: service.calls(), manager };
+}
 
-    test('a stream that already has an upstream finish is not requested again', async () => {
-        const service = serviceWith([[chunk('complete', 'STOP')]]);
-        const body = await run(service);
-        expect(service.calls()).toBe(1);
-        expect(body).toContain('complete');
-        expect(body.match(/data: \[DONE\]/g)).toHaveLength(1);
-    });
-
-    test('a native Claude message_stop counts as finished', async () => {
+describe('upstream stream completion and truncation', () => {
+    test('a finished Responses stream is requested once', async () => {
         const service = serviceWith([[
-            { type: 'message_start', message: { id: 'm', type: 'message', role: 'assistant', content: [], usage: { input_tokens: 1, output_tokens: 0 } } },
-            { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+            { type: 'response.created', response: { id: 'resp-1', model: 'grok' } },
+            { type: 'response.output_text.delta', delta: 'hello' },
+            { type: 'response.completed', response: { output: [], usage: {} } }
+        ]]);
+        const { calls, body } = await run(service, 'openai', 'grok-cli-oauth', 'grok');
+        expect(calls).toBe(1);
+        expect(body).toContain('hello');
+    });
+
+    test('a native Claude message_stop is requested once', async () => {
+        const service = serviceWith([[
+            { type: 'message_start', message: { id: 'm', type: 'message', role: 'assistant', content: [], usage: {} } },
             { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } },
-            { type: 'content_block_stop', index: 0 },
-            { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } },
             { type: 'message_stop' }
         ]]);
-        const body = await run(service, 'claude', 'claude-kiro', 'claude-sonnet');
-        expect(service.calls()).toBe(1);
-        expect(body).toContain('message_stop');
+        const { calls } = await run(service, 'claude', 'claude-kiro', 'claude-sonnet');
+        expect(calls).toBe(1);
+    });
+
+    test('a partial tool argument is not concatenated with a replayed request', async () => {
+        const service = serviceWith([
+            [{ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call-1', function: { name: 'lookup', arguments: '{"x":' } }] } }] }],
+            [{ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call-1', function: { name: 'lookup', arguments: '{"x":1}' } }] }, finish_reason: 'tool_calls' }] }]
+        ]);
+        const { calls, body, manager } = await run(service, 'openai', 'openai-custom', 'gpt-4o');
+        const events = body.split('\n').filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
+            .map(line => JSON.parse(line.slice(6)));
+        const argument = events.find(event => event.choices)?.choices[0].delta.tool_calls[0].function.arguments;
+        expect(calls).toBe(1);
+        expect(argument).toBe('{"x":');
+        expect(argument).not.toContain('{"x":1}');
+        expect(events.some(event => event.error)).toBe(true);
+        expect(manager.markProviderHealthy).not.toHaveBeenCalled();
+    });
+
+    test('an EOF after a malformed finish is a truncation, not a success', async () => {
+        const malformed = { candidates: [{ finishReason: 'MALFORMED_FUNCTION_CALL', content: { role: 'model', parts: [{ text: 'partial' }] } }] };
+        const service = serviceWith([
+            [malformed],
+            [{ candidates: [{ content: { role: 'model', parts: [{ text: 'partial' }] } }] }]
+        ]);
+        const { body, manager } = await run(service);
+        expect(body).toContain('error');
+        expect(manager.markProviderHealthy).not.toHaveBeenCalled();
+    });
+
+    test('three truncated attempts end as an error instead of a synthetic success', async () => {
+        const textOnly = { candidates: [{ content: { role: 'model', parts: [{ text: 'partial' }] } }] };
+        const service = serviceWith([[], [], [textOnly]]);
+        const { calls, body, manager } = await run(service);
+        expect(calls).toBeLessThanOrEqual(3);
+        expect(body).toContain('error');
+        expect(manager.markProviderHealthy).not.toHaveBeenCalled();
     });
 });
