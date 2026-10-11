@@ -196,6 +196,43 @@ describe('Gemini → Claude stream protocol (#718)', () => {
         expect(stops(out)).toHaveLength(2);
     });
 
+    test('synthetic text block closes when the message ends even without a tool call', async () => {
+        const { out } = await run({ nativeChunks: [
+            geminiChunk({ text: 'Hello' }),
+            geminiChunk({ finishReason: 'STOP' })
+        ] });
+        const started = starts(out).map(x => x.data.index);
+        const closed = stops(out).map(x => x.data.index);
+        expect(started).toEqual([0]);
+        expect(closed).toEqual([0]);
+        expect(out.filter(x => x.data?.type === 'message_stop')).toHaveLength(1);
+    });
+
+    test('synthetic text block closes before a following tool block opens', async () => {
+        const { out } = await run({ nativeChunks: [
+            geminiChunk({ text: 'Let me look that up.' }),
+            geminiChunk({ call: { id: 'a', name: 'lookup', args: { a: 1 } }, finishReason: 'STOP' })
+        ] });
+        const started = starts(out).map(x => x.data.index);
+        const closed = stops(out).map(x => x.data.index);
+        expect(started).toEqual([0, 1]);
+        expect(closed).toEqual([0, 1]);
+        const events = out.map(x => x.data?.type);
+        expect(events.indexOf('content_block_stop')).toBeLessThan(events.lastIndexOf('content_block_start'));
+    });
+
+    test('synthetic thinking block closes before a following tool block opens', async () => {
+        const { out } = await run({ nativeChunks: [
+            geminiChunk({ text: 'Thinking', thought: true }),
+            geminiChunk({ call: { id: 'a', name: 'lookup', args: { a: 1 } }, finishReason: 'STOP' })
+        ] });
+        const started = starts(out).map(x => x.data.index);
+        const closed = stops(out).map(x => x.data.index);
+        expect(started).toEqual([0, 1]);
+        expect(closed).toEqual([0, 1]);
+        expect(out.find(x => x.data?.type === 'content_block_start').data.content_block.type).toBe('thinking');
+    });
+
     test('empty first stream then recursive retry emits one complete shared Claude sequence', async () => {
         const first = { generateContentStream: jest.fn(() => streamOf([])) };
         mockRetryService.generateContentStream.mockImplementation(() => streamOf([

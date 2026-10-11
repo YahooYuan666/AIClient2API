@@ -1103,7 +1103,17 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         };
         const startSyntheticBlock = blockType => {
             const index = claudeStreamState.nextIndex++;
-            claudeStreamState.current = { index, type: blockType, toolId: null };
+            // 合成块也必须登记进 open，收尾时才会被 closeAllOpen 关闭；
+            // sourceIndex 用字符串键，永不与转换器提供的整数索引相撞。
+            const opened = {
+                index,
+                sourceIndex: `synthetic-${index}`,
+                type: blockType,
+                toolId: null,
+                ownsSourceIndex: false
+            };
+            claudeStreamState.open.set(opened.sourceIndex, opened);
+            claudeStreamState.current = opened;
             if (isClaudeToolBlock(blockType)) claudeStreamState.sawToolUse = true;
             out.push({
                 type: 'content_block_start',
@@ -1135,7 +1145,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             if (suppliedIndex !== null && claudeStreamState.open.has(suppliedIndex)) {
                 claudeStreamState.indexesUnreliable = true;
             }
-            if (!isClaudeToolBlock(blockType)) closeCurrent();
+            // 工具块之后可能还有交错的参数（Responses 并行调用），所以当前是工具块时
+            // 不能关；当前是合成的文本/思考块时必须先关，否则它会被覆盖且永无收尾。
+            if (claudeStreamState.current && !isClaudeToolBlock(claudeStreamState.current.type)) closeCurrent();
 
             const index = claudeStreamState.nextIndex++;
             const block = chunk.content_block ? { ...chunk.content_block } : { type: blockType, text: '' };
