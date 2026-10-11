@@ -1173,7 +1173,9 @@ export class ClaudeConverter extends BaseConverter {
                     generationConfig.thinkingConfig = {};
                 }
                 generationConfig.thinkingConfig.thinkingBudget = budget;
-                generationConfig.thinkingConfig.include_thoughts = true;
+                // 必须用驼峰 includeThoughts：下游 gemini/antigravity 层只认驼峰并在缺失时补写，
+                // 蛇形字段会和它们补的驼峰同时出现在 JSON 里，Google 的 proto oneof 视为重复赋值直接 400。
+                generationConfig.thinkingConfig.includeThoughts = true;
             }
         }
         

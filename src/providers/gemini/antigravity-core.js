@@ -293,6 +293,9 @@ function applyAntigravityThinkingLevelConfig(thinkingConfig, level) {
     thinkingConfig.includeThoughts = true;
     delete thinkingConfig.thinkingBudget;
     delete thinkingConfig.thinking_budget;
+    // 兜底清掉蛇形 include_thoughts：与驼峰 includeThoughts 同指一个 proto oneof，
+    // 两者并存会被 Google 拒绝（_include_thoughts is already set. Cannot set 'includeThoughts'）。
+    delete thinkingConfig.include_thoughts;
     return thinkingConfig;
 }
 
