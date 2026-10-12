@@ -2091,10 +2091,10 @@ export class AntigravityApiService {
     async getQuotaSummary() {
         if (!this.isInitialized) await this.initialize();
 
-        for (const baseURL of this.baseURLs) {
-            try {
-                const requestOptions = {
-                    url: `${baseURL}/${ANTIGRAVITY_API_VERSION}:retrieveUserQuotaSummary`,
+        const quotaBaseURL = ANTIGRAVITY_BASE_URL_DAILY;
+        try {
+            const requestOptions = {
+                url: `${quotaBaseURL}/${ANTIGRAVITY_API_VERSION}:retrieveUserQuotaSummary`,
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -2103,14 +2103,13 @@ export class AntigravityApiService {
                     responseType: 'json',
                     body: JSON.stringify({})
                 };
-                this._applySidecar(requestOptions);
-                const res = await this.authClient.request(requestOptions);
-                if (res.data) return res.data;
-            } catch (error) {
-                logger.error(`[Antigravity] Failed to fetch quota summary from ${baseURL}:`, error.message);
-            }
+            this._applySidecar(requestOptions);
+            const res = await this.authClient.request(requestOptions);
+            if (res.data) return res.data;
+        } catch (error) {
+            logger.error(`[Antigravity] Failed to fetch quota summary from ${quotaBaseURL}:`, error.message);
         }
-        throw new Error('Failed to fetch quota summary from all endpoints');
+        throw new Error('Failed to fetch quota summary');
     }
 
     async getUsageLimits() {

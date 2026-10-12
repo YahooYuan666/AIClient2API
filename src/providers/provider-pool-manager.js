@@ -1234,7 +1234,13 @@ export class ProviderPoolManager {
 
     async _refreshDueQuota(providerType, { startup = false, reason = 'interval' } = {}) {
         this._log('info', `[Quota Refresh] ${reason} scan for ${providerType}`);
-        for (const provider of this.providerStatus[providerType] || []) {
+        const providers = this.providerStatus[providerType] || [];
+        for (let index = 0; index < providers.length; index += 1) {
+            const provider = providers[index];
+            if (index > 0) {
+                const delay = this.globalConfig.QUOTA_REFRESH_STAGGER_MS ?? (1000 + Math.floor(Math.random() * 4000));
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
             const uuid = provider.config.uuid;
             const displayName = this._getDisplayName(provider.config);
             if (!uuid || !this.accountScheduler.shouldRefresh(uuid, { startup }) || this.refreshingUuids.has(uuid)) continue;

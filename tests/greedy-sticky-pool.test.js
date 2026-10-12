@@ -35,7 +35,7 @@ function pool(scheduler) {
             node('low', 0.2, 100)
         ]
     }, {
-        globalConfig: { ACCOUNT_SCHEDULER: scheduler },
+        globalConfig: { ACCOUNT_SCHEDULER: scheduler, QUOTA_REFRESH_STAGGER_MS: 0 },
         saveDebounceTime: 100000
     });
     manager._getBaseProviderType = () => 'gemini-antigravity';
