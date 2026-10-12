@@ -2089,7 +2089,8 @@ export class AntigravityApiService {
      * @returns {Promise<Object>} 原始配额信息
      */
     async getQuotaSummary() {
-        if (!this.isInitialized) await this.initialize();
+        await this.loadCredentials();
+        if (this.isTokenExpiringSoon()) await this.initializeAuth();
 
         const quotaBaseURL = ANTIGRAVITY_BASE_URL_DAILY;
         try {
