@@ -13,6 +13,7 @@ import {
 } from './provider-models.js';
 import { broadcastEvent } from '../ui-modules/event-broadcast.js';
 import { ENDPOINT_TYPE } from '../utils/common.js';
+import { extractQuotaWindows, GreedyStickyScheduler } from './greedy-sticky-scheduler.js';
 
 function getCustomModelAliasesForProvider(config, providerType) {
     const customModels = Array.isArray(config?.customModels) ? config.customModels : [];
@@ -116,6 +117,10 @@ export class ProviderPoolManager {
         
         // 用于并发选点时的原子排序辅助（自增序列）
         this._selectionSequence = 0;
+        this.accountScheduler = this.globalConfig.ACCOUNT_SCHEDULER === 'greedy-sticky'
+            ? new GreedyStickyScheduler()
+            : null;
+        this.accountSchedulerHeld = new Set();
  
         this.initializeProviderStatus();
     }
@@ -901,6 +906,9 @@ export class ProviderPoolManager {
      * @param {object} options 
      */
     async acquireSlot(providerType, requestedModel = null, options = {}) {
+        if (this._usesGreedySticky(providerType)) {
+            return this._acquireGreedyStickySlot(providerType, requestedModel, options);
+        }
         // 使用 selectProvider 进行初次选择（评分逻辑已经包含了并发考虑）
         const selectedConfig = await this.selectProvider(providerType, requestedModel, { ...options, skipUsageCount: true });
         
@@ -974,6 +982,9 @@ export class ProviderPoolManager {
      */
     releaseSlot(providerType, uuid) {
         if (!providerType || !uuid) return;
+        if (this.accountSchedulerHeld.delete(`${providerType}:${uuid}`)) {
+            this.accountScheduler.release(uuid);
+        }
         
         const provider = this._findProvider(providerType, uuid);
         if (!provider) return;
@@ -1133,6 +1144,102 @@ export class ProviderPoolManager {
         this._log('debug', `Selected provider for ${providerType} (LRU): ${this._getDisplayName(selected.config)}${requestedModel ? ` for model: ${requestedModel}` : ''}${options.skipUsageCount ? ' (skip usage count)' : ''}`);
         
         return selected.config;
+    }
+
+    _usesGreedySticky(providerType) {
+        return Boolean(this.accountScheduler) && this._getBaseProviderType(providerType) === MODEL_PROVIDER.ANTIGRAVITY;
+    }
+
+    _greedyAccountView(providerType, requestedModel, options = {}) {
+        const excluded = new Set(Array.isArray(options.excludeUuids) ? options.excludeUuids : []);
+        this._checkAndRecoverScheduledProviders(providerType);
+        return (this.providerStatus[providerType] || [])
+            .filter(provider => provider.config.isHealthy && !provider.config.isDisabled && !excluded.has(provider.config.uuid))
+            .filter(provider => this._supportsRequestedModel(providerType, provider, requestedModel))
+            .map(provider => ({
+                uuid: provider.config.uuid,
+                config: provider.config,
+                weekly: provider.config.quotaWindows?.weekly || null,
+                fiveHour: provider.config.quotaWindows?.fiveHour || null,
+                updatedAt: provider.config.quotaWindowsUpdatedAt || 0
+            }));
+    }
+
+    _supportsRequestedModel(providerType, provider, requestedModel) {
+        if (!requestedModel) return true;
+        const supportedModels = getConfiguredSupportedModels(providerType, provider.config);
+        if (supportedModels.length > 0) return supportedModels.includes(requestedModel);
+        return !Array.isArray(provider.config.notSupportedModels) || !provider.config.notSupportedModels.includes(requestedModel);
+    }
+
+    async _acquireGreedyStickySlot(providerType, requestedModel, options) {
+        this.accountScheduler.noteUserRequest();
+        this._scheduleQuotaRefresh(providerType);
+        const accounts = this._greedyAccountView(providerType, requestedModel, options);
+        const decision = await this.accountScheduler.acquire({
+            uuid: options.stickyUuid,
+            sessionId: options.sessionId,
+            accounts
+        });
+        if (decision.status === 'quota-exhausted') {
+            const error = new Error(`Antigravity quota exhausted${decision.resetAt ? `; earliest reset ${decision.resetAt}` : ''}`);
+            error.status = 429;
+            error.code = 429;
+            error.quotaExhausted = true;
+            throw error;
+        }
+        if (decision.status !== 'acquired') {
+            const error = new Error('Antigravity account is busy');
+            error.status = 429;
+            error.code = 429;
+            throw error;
+        }
+        const selected = accounts.find(account => account.uuid === decision.uuid);
+        if (!selected) return null;
+        this.accountSchedulerHeld.add(`${providerType}:${decision.uuid}`);
+        selected.config.lastUsed = new Date().toISOString();
+        this._debouncedSave(providerType);
+        this._log('info', `[Greedy Sticky] Selected ${this._getDisplayName(selected.config)} for ${options.sessionId || 'unscoped request'}`);
+        return selected.config;
+    }
+
+    _scheduleQuotaRefresh(providerType) {
+        if (this._quotaRefreshTimer) return;
+        this._quotaRefreshTimer = setTimeout(() => {
+            this._quotaRefreshTimer = null;
+            this._refreshDueQuota(providerType).catch(error => {
+                this._log('warn', `Quota refresh failed: ${error.message}`);
+            });
+        }, 0);
+        this._quotaRefreshTimer.unref?.();
+    }
+
+    async _refreshDueQuota(providerType) {
+        for (const provider of this.providerStatus[providerType] || []) {
+            const uuid = provider.config.uuid;
+            if (!uuid || !this.accountScheduler.shouldRefresh(uuid) || this.refreshingUuids.has(uuid)) continue;
+            this.accountScheduler.markRefreshed(uuid);
+            this.refreshingUuids.add(uuid);
+            this.accountScheduler.setRefreshing(uuid, true);
+            try {
+                const tempConfig = { ...this.globalConfig, ...provider.config, MODEL_PROVIDER: providerType };
+                delete tempConfig.providerPools;
+                const service = getServiceAdapter(tempConfig);
+                const usage = typeof service.antigravityApiService?.getUsageLimits === 'function'
+                    ? await service.antigravityApiService.getUsageLimits()
+                    : null;
+                const windows = extractQuotaWindows(usage);
+                provider.config.quotaWindows = windows;
+                provider.config.quotaWindowsUpdatedAt = Date.now();
+                this.accountScheduler.updateAccount(uuid, { uuid, ...windows });
+            } catch (error) {
+                this._log('warn', `Quota refresh failed for ${this._getDisplayName(provider.config)}: ${error.message}`);
+            } finally {
+                this.refreshingUuids.delete(uuid);
+                this.accountScheduler.setRefreshing(uuid, false);
+                this.accountScheduler.notify(uuid);
+            }
+        }
     }
 
     /**

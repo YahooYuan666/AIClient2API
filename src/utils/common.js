@@ -8,6 +8,7 @@ import { convertData, getOpenAIStreamChunkStop, releaseStreamState } from '../co
 import { ProviderStrategyFactory } from './provider-strategies.js';
 import { getPluginManager } from '../core/plugin-manager.js';
 import { MODEL_PROTOCOL_PREFIX, MODEL_PROVIDER } from './constants.js';
+import { extractSessionId } from '../providers/greedy-sticky-scheduler.js';
 
 // ==================== 时间与时区 ====================
 
@@ -971,7 +972,10 @@ async function resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, log
     try {
         // 动态导入以避免循环依赖
         const { getApiServiceWithFallback } = await import('../services/service-manager.js');
-        const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true });
+        const result = await getApiServiceWithFallback(CONFIG, model, {
+            acquireSlot: true,
+            sessionId: extractSessionId(requestBody)
+        });
 
         if (result && result.service) {
             logger.info(`${logPrefix} Retrying ${failureLabel} from ${providerLabel} with credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -1613,6 +1617,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 // 使用 acquireSlot: true 以占用新凭证的并发插槽
                 const result = await getApiServiceWithFallback(CONFIG, model, {
                     acquireSlot: true,
+                    sessionId: extractSessionId(requestBody),
+                    stickyUuid: pooluuid,
                     excludeUuids: cooldown.quotaExhausted && pooluuid ? [pooluuid] : []
                 });
                 
@@ -1896,6 +1902,8 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                 // 使用 acquireSlot: true 以占用新凭证的并发插槽
                 const result = await getApiServiceWithFallback(CONFIG, model, {
                     acquireSlot: true,
+                    sessionId: extractSessionId(requestBody),
+                    stickyUuid: pooluuid,
                     excludeUuids: cooldown.quotaExhausted && pooluuid ? [pooluuid] : []
                 });
                 
@@ -2161,7 +2169,10 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     const shouldSelectByPool = providerPoolManager && (CONFIG.MODEL_PROVIDER === MODEL_PROVIDER.AUTO || (CONFIG.providerPools && CONFIG.providerPools[CONFIG.MODEL_PROVIDER]));
     if (!service || shouldSelectByPool) {
         const { getApiServiceWithFallback } = await import('../services/service-manager.js');
-        const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: shouldSelectByPool });
+        const result = await getApiServiceWithFallback(CONFIG, model, {
+            acquireSlot: shouldSelectByPool,
+            sessionId: extractSessionId(originalRequestBody)
+        });
 
         service = result.service;
         toProvider = result.actualProviderType;
