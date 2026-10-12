@@ -1227,6 +1227,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     };
     let sawUpstreamFinish = false; // 上游是否已声明终止，与客户端协议无关
     let streamAttemptFinished = false;
+    let responseFailureAttempts = retryContext?.responseFailureRetry ?? retryContext?.emptyResponseRetry ?? 0;
 
     try {
         // fs.writeFile('request'+Date.now()+'.json', JSON.stringify(requestBody));
@@ -1441,6 +1442,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (!retrySignal) break;
 
         midStreamRetryCount += 1;
+        responseFailureAttempts += 1;
         logger.warn(`[Stream Retry] ${retrySignal.responseFailureCode || retrySignal.responseFailureLabel || 'retryable failure'} after data already sent to client. Retrying the same upstream request invisibly (${midStreamRetryCount}/${MID_STREAM_RETRY_MAX})...`);
         const retryDelayMs = CONFIG?.EMPTY_RESPONSE_RETRY_DELAY_MS ?? 500;
         if (retryDelayMs > 0) {
@@ -1500,7 +1502,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 协议策略识别出的可重试终止失败和 provider core 抛出的空响应共享独立的小额预算，
         // 不占用凭证切换预算；重试沿用同一 requestBody，不增加会话历史。
         if (error.isRetryableUpstreamResponseFailure || error.isEmptyUpstreamResponse) {
-            const attemptsMade = retryContext?.responseFailureRetry ?? retryContext?.emptyResponseRetry ?? 0;
+            const attemptsMade = responseFailureAttempts;
             const failureLabel = error.responseFailureLabel || 'upstream response failure';
             const outcome = await resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, '[Stream Retry]', toProvider, failureLabel);
 
