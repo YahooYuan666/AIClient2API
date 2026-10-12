@@ -114,4 +114,14 @@ describe('optional greedy sticky pool selection', () => {
         expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('weekly 90%'));
         expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('5h 50%'));
     });
+
+    test('an exhausted account is skipped and the next account serves the retry', async () => {
+        const manager = pool('greedy-sticky');
+        manager.markProviderUnhealthy('openai-custom', { uuid: 'high' }, 'quota exhausted');
+        const selected = await manager.acquireSlot('openai-custom', null, {
+            sessionId: 'conversation',
+            excludeUuids: ['high']
+        });
+        expect(selected.uuid).toBe('low');
+    });
 });

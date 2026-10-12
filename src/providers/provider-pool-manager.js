@@ -120,6 +120,7 @@ export class ProviderPoolManager {
         this.accountScheduler = this.globalConfig.ACCOUNT_SCHEDULER === 'greedy-sticky'
             ? new GreedyStickyScheduler()
             : null;
+        this._log('info', `[Scheduler] ACCOUNT_SCHEDULER=${this.globalConfig.ACCOUNT_SCHEDULER || 'lru'}`);
         this.accountSchedulerHeld = new Set();
  
         this.initializeProviderStatus();
@@ -1183,7 +1184,6 @@ export class ProviderPoolManager {
 
     async _acquireGreedyStickySlot(providerType, requestedModel, options) {
         this.accountScheduler.noteUserRequest();
-        this._scheduleQuotaRefresh(providerType, { reason: 'request' });
         const accounts = this._greedyAccountView(providerType, requestedModel, options);
         const decision = await this.accountScheduler.acquire({
             uuid: options.stickyUuid,
@@ -1237,10 +1237,7 @@ export class ProviderPoolManager {
         for (const provider of this.providerStatus[providerType] || []) {
             const uuid = provider.config.uuid;
             const displayName = this._getDisplayName(provider.config);
-            if (!uuid || !this.accountScheduler.shouldRefresh(uuid, { startup }) || this.refreshingUuids.has(uuid)) {
-                this._log('info', `[Quota Refresh] ${reason} skipped ${displayName}`);
-                continue;
-            }
+            if (!uuid || !this.accountScheduler.shouldRefresh(uuid, { startup }) || this.refreshingUuids.has(uuid)) continue;
             this.accountScheduler.markRefreshed(uuid);
             this.refreshingUuids.add(uuid);
             this.accountScheduler.setRefreshing(uuid, true);

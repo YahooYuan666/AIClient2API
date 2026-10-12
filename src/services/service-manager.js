@@ -275,8 +275,12 @@ export async function initApiService(config, isReady = false) {
     // Initialize or update ProviderPoolManager
     if (providerPoolManager) {
         providerPoolManager.providerPools = config.providerPools || {};
+        providerPoolManager.globalConfig = config;
+        providerPoolManager.accountScheduler = config.ACCOUNT_SCHEDULER === 'greedy-sticky'
+            ? providerPoolManager.accountScheduler || new (await import('../providers/greedy-sticky-scheduler.js')).GreedyStickyScheduler()
+            : null;
         providerPoolManager.initializeProviderStatus();
-        logger.info('[Initialization] ProviderPoolManager existing instance updated.');
+        logger.info(`[Initialization] ProviderPoolManager existing instance updated (scheduler: ${config.ACCOUNT_SCHEDULER || 'lru'}).`);
     } else {
         providerPoolManager = new ProviderPoolManager(config.providerPools || {}, {
             globalConfig: config,
