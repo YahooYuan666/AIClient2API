@@ -48,6 +48,14 @@ export function extractSessionId(requestBody) {
     }
 }
 
+export function accountQuotaState(account, now = Date.now()) {
+    const weekly = quotaWindowState(account?.weekly, now);
+    const fiveHour = quotaWindowState(account?.fiveHour, now);
+    if (weekly === 'unknown' || fiveHour === 'unknown') return 'unknown';
+    if (weekly === 'exhausted' || fiveHour === 'exhausted') return 'exhausted';
+    return 'known';
+}
+
 export function quotaWindowState(window, now = Date.now()) {
     if (!window || !isFraction(window.remainingFraction) || !Number.isFinite(Date.parse(window.resetAt || ''))) {
         return 'unknown';
@@ -202,9 +210,8 @@ export class GreedyStickyScheduler {
     blocked(uuid) {
         if (this.unhealthy.has(uuid)) return true;
         const account = this.accounts.get(uuid);
-        if (!account) return false;
-        return quotaWindowState(account.fiveHour, this.now()) === 'exhausted'
-            || quotaWindowState(account.weekly, this.now()) === 'exhausted';
+        if (!account) return true;
+        return accountQuotaState(account, this.now()) !== 'known';
     }
 
     allCapacityFull(accounts) {

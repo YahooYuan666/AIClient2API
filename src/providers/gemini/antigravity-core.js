@@ -1516,8 +1516,10 @@ export class AntigravityApiService {
                 if (isQuotaExhaustedError(error)) {
                     await normalizeProviderErrorMessage(error, { status: 429, context: 'callApi' });
                     const recoveryTime = getQuotaRecoveryTime(error);
-                    if (recoveryTime) error.quotaRecoveryTime = recoveryTime;
-                    error.quotaExhausted = true;
+                    if (recoveryTime) {
+                        error.quotaRecoveryTime = recoveryTime;
+                        error.quotaExhausted = true;
+                    }
                     logger.warn(`[Antigravity API] Quota exhausted (429 RESOURCE_EXHAUSTED). Not retrying the same credential; throwing to upper layer.${recoveryTime ? ` Recovery at ${recoveryTime.toISOString()}.` : ''}`);
                     error.shouldSwitchCredential = true;
                     error.skipErrorCount = true;
@@ -1691,8 +1693,10 @@ export class AntigravityApiService {
                 if (isQuotaExhaustedError(error)) {
                     await normalizeProviderErrorMessage(error, { status: 429, context: 'stream' });
                     const recoveryTime = getQuotaRecoveryTime(error);
-                    if (recoveryTime) error.quotaRecoveryTime = recoveryTime;
-                    error.quotaExhausted = true;
+                    if (recoveryTime) {
+                        error.quotaRecoveryTime = recoveryTime;
+                        error.quotaExhausted = true;
+                    }
                     logger.warn(`[Antigravity API] Quota exhausted (429 RESOURCE_EXHAUSTED) during stream. Not retrying the same credential; throwing to upper layer.${recoveryTime ? ` Recovery at ${recoveryTime.toISOString()}.` : ''}`);
                     error.shouldSwitchCredential = true;
                     error.skipErrorCount = true;

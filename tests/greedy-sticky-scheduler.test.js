@@ -93,6 +93,13 @@ describe('greedy sticky assignment', () => {
         await expect(gate.acquire({ uuid: 'only', accounts, sessionId: 'conversation' })).resolves.toMatchObject({ status: 'busy' });
     });
 
+    test('an account is not usable until both quota windows are known', async () => {
+        const gate = scheduler();
+        const unknown = { uuid: 'unknown', weekly: null, fiveHour: null, updatedAt: now };
+        const known = account('known', 0.2, 100);
+        await expect(gate.acquire({ accounts: [unknown, known], sessionId: 'conversation' })).resolves.toMatchObject({ uuid: 'known' });
+    });
+
     test('all exhausted accounts return the earliest reset instead of waiting', async () => {
         const gate = scheduler();
         const accounts = [account('one', 0, 30, 0), account('two', 0, 10, 0)];

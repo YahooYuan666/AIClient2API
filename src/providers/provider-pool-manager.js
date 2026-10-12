@@ -1184,6 +1184,7 @@ export class ProviderPoolManager {
 
     async _acquireGreedyStickySlot(providerType, requestedModel, options) {
         this.accountScheduler.noteUserRequest();
+        await this._refreshDueQuota(providerType, { startup: true, reason: 'before-request' });
         const accounts = this._greedyAccountView(providerType, requestedModel, options);
         const decision = await this.accountScheduler.acquire({
             uuid: options.stickyUuid,
