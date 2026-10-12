@@ -1184,7 +1184,7 @@ export class ProviderPoolManager {
 
     async _acquireGreedyStickySlot(providerType, requestedModel, options) {
         this.accountScheduler.noteUserRequest();
-        await this._refreshDueQuota(providerType, { startup: true, reason: 'before-request' });
+        this._scheduleQuotaRefresh(providerType, { reason: 'background' });
         const accounts = this._greedyAccountView(providerType, requestedModel, options);
         const decision = await this.accountScheduler.acquire({
             uuid: options.stickyUuid,
@@ -1256,6 +1256,11 @@ export class ProviderPoolManager {
                     ? await service.antigravityApiService.getQuotaSummary()
                     : null;
                 const windows = extractQuotaWindows(usage);
+                if (!windows.weekly || !windows.fiveHour) {
+                    this.accountScheduler.lastRefreshAt.delete(uuid);
+                    this._log('warn', `[Quota Refresh] ${reason} ${displayName}: incomplete quota, keeping the last known result`);
+                    continue;
+                }
                 provider.config.quotaWindows = windows;
                 provider.config.quotaWindowsUpdatedAt = Date.now();
                 this.accountScheduler.updateAccount(uuid, { uuid, ...windows });
