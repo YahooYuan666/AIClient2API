@@ -102,6 +102,13 @@ describe('upstream stream completion and truncation', () => {
         expect(manager.markProviderHealthy).not.toHaveBeenCalled();
     });
 
+    test('repeated malformed responses stay within the shared retry budget', async () => {
+        const malformed = { candidates: [{ finishReason: 'MALFORMED_FUNCTION_CALL' }] };
+        const service = serviceWith([[malformed]]);
+        const { calls } = await run(service);
+        expect(calls).toBe(3);
+    });
+
     test('three truncated attempts end as an error instead of a synthetic success', async () => {
         const textOnly = { candidates: [{ content: { role: 'model', parts: [{ text: 'partial' }] } }] };
         const service = serviceWith([[], [], [textOnly]]);
