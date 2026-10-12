@@ -1279,6 +1279,10 @@ export class ProviderPoolManager {
      * 获取一个可用的提供商插槽，支持 Fallback 机制
      */
     async acquireSlotWithFallback(providerType, requestedModel = null, options = {}) {
+        if (this._usesGreedySticky(providerType)) {
+            const selectedConfig = await this._acquireGreedyStickySlot(providerType, requestedModel, options);
+            return selectedConfig ? { config: selectedConfig, actualProviderType: providerType, isFallback: false } : null;
+        }
         if (!providerType || typeof providerType !== 'string') {
             this._log('error', `Invalid providerType: ${providerType}`);
             return null;
@@ -1405,6 +1409,10 @@ export class ProviderPoolManager {
      * @returns {Promise<object|null>} An object containing the selected provider's configuration and the actual provider type used, or null if no healthy provider is found.
      */
     async selectProviderWithFallback(providerType, requestedModel = null, options = {}) {
+        if (this._usesGreedySticky(providerType)) {
+            const selectedConfig = await this._acquireGreedyStickySlot(providerType, requestedModel, options);
+            return selectedConfig ? { config: selectedConfig, actualProviderType: providerType, isFallback: false } : null;
+        }
         // 参数校验
         if (!providerType || typeof providerType !== 'string') {
             this._log('error', `Invalid providerType: ${providerType}`);
