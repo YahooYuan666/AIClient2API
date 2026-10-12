@@ -934,6 +934,23 @@ export function createUpstreamResponseFailureError(providerLabel = 'Upstream', f
     return error;
 }
 
+function isThinkingOnlyClaudeChunk(chunk) {
+    const type = chunk?.type;
+    if (type === 'message_start' || type === 'ping' || type === 'content_block_stop') return true;
+    if (type === 'content_block_start') return chunk.content_block?.type === 'thinking';
+    if (type === 'content_block_delta') {
+        const deltaType = chunk.delta?.type;
+        return deltaType === 'thinking_delta' || deltaType === 'signature_delta' || (deltaType === 'text_delta' && !chunk.delta?.text);
+    }
+    return false;
+}
+
+function writeStreamChunk(res, chunk, clientDisconnected, addEvent) {
+    if (clientDisconnected.value || res.writableEnded) return;
+    if (addEvent) res.write(`event: ${chunk.type}\n`);
+    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+}
+
 function throwIfUpstreamResponseFailed(response, provider, providerLabel = provider) {
     const failure = classifyUpstreamResponseFailure(response, provider);
     if (failure) {
@@ -1266,6 +1283,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 已经写出一半后不能把整段请求重放并拼接：工具参数会变成非法 JSON，文本也会重复前缀。
         const MID_STREAM_RETRY_MAX = 2;
         let midStreamRetryCount = 0;
+        const pendingThinkingChunks = [];
 
         while (true) {
         let retrySignal = null;
@@ -1356,6 +1374,19 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 if (clientDisconnected.value) {
                     break;
                 }
+
+                // 空函数调用到来前，Gemini 可能先吐出思考内容。先暂存这些内容，
+                // 只有后续确认不是 MALFORMED_FUNCTION_CALL 才发给客户端，从而保留重试机会。
+                if (shouldNormalizeClaudeStream && !anyDataSent && isThinkingOnlyClaudeChunk(chunk)) {
+                    pendingThinkingChunks.push(chunk);
+                    continue;
+                }
+                if (pendingThinkingChunks.length) {
+                    for (const pendingChunk of pendingThinkingChunks.splice(0)) {
+                        writeStreamChunk(res, pendingChunk, clientDisconnected, addEvent);
+                        anyDataSent = true;
+                    }
+                }
                 
                 // [FIX] 跟踪工具调用并在结束时修正 finish_reason
                 // OpenAI 格式
@@ -1434,6 +1465,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
         if (clientGone) break;
 
+            if (!retrySignal && pendingThinkingChunks.length) {
+                for (const pendingChunk of pendingThinkingChunks.splice(0)) {
+                    writeStreamChunk(res, pendingChunk, clientDisconnected, addEvent);
+                    anyDataSent = true;
+                }
+            }
             sawUpstreamFinish = streamAttemptFinished;
             streamAttemptFinished = false;
             // 本次尝试没有原生终止信号。客户端还没收到内容时可以再要一次；
