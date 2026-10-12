@@ -1146,6 +1146,15 @@ export class ProviderPoolManager {
         return selected.config;
     }
 
+    _formatQuotaWindows(windows) {
+        const weekly = windows?.weekly;
+        const fiveHour = windows?.fiveHour;
+        const part = (label, window) => window
+            ? `${label} ${Math.round(window.remainingFraction * 100)}% until ${window.resetAt}`
+            : `${label} unavailable`;
+        return `${part('weekly', weekly)}; ${part('5h', fiveHour)}`;
+    }
+
     _usesGreedySticky(providerType) {
         return Boolean(this.accountScheduler) && this._getBaseProviderType(providerType) === MODEL_PROVIDER.ANTIGRAVITY;
     }
@@ -1174,7 +1183,7 @@ export class ProviderPoolManager {
 
     async _acquireGreedyStickySlot(providerType, requestedModel, options) {
         this.accountScheduler.noteUserRequest();
-        this._scheduleQuotaRefresh(providerType);
+        this._scheduleQuotaRefresh(providerType, { reason: 'request' });
         const accounts = this._greedyAccountView(providerType, requestedModel, options);
         const decision = await this.accountScheduler.acquire({
             uuid: options.stickyUuid,
@@ -1203,21 +1212,35 @@ export class ProviderPoolManager {
         return selected.config;
     }
 
-    _scheduleQuotaRefresh(providerType) {
+    refreshQuotaOnStartup() {
+        if (!this.accountScheduler) return;
+        for (const providerType of Object.keys(this.providerStatus)) {
+            if (this._usesGreedySticky(providerType)) {
+                this._scheduleQuotaRefresh(providerType, { startup: true, reason: 'startup' });
+            }
+        }
+    }
+
+    _scheduleQuotaRefresh(providerType, { startup = false, reason = 'interval' } = {}) {
         if (this._quotaRefreshTimer) return;
         this._quotaRefreshTimer = setTimeout(() => {
             this._quotaRefreshTimer = null;
-            this._refreshDueQuota(providerType).catch(error => {
-                this._log('warn', `Quota refresh failed: ${error.message}`);
+            this._refreshDueQuota(providerType, { startup, reason }).catch(error => {
+                this._log('warn', `[Quota Refresh] ${reason} failed: ${error.message}`);
             });
         }, 0);
         this._quotaRefreshTimer.unref?.();
     }
 
-    async _refreshDueQuota(providerType) {
+    async _refreshDueQuota(providerType, { startup = false, reason = 'interval' } = {}) {
+        this._log('info', `[Quota Refresh] ${reason} scan for ${providerType}`);
         for (const provider of this.providerStatus[providerType] || []) {
             const uuid = provider.config.uuid;
-            if (!uuid || !this.accountScheduler.shouldRefresh(uuid) || this.refreshingUuids.has(uuid)) continue;
+            const displayName = this._getDisplayName(provider.config);
+            if (!uuid || !this.accountScheduler.shouldRefresh(uuid, { startup }) || this.refreshingUuids.has(uuid)) {
+                this._log('info', `[Quota Refresh] ${reason} skipped ${displayName}`);
+                continue;
+            }
             this.accountScheduler.markRefreshed(uuid);
             this.refreshingUuids.add(uuid);
             this.accountScheduler.setRefreshing(uuid, true);
@@ -1225,15 +1248,16 @@ export class ProviderPoolManager {
                 const tempConfig = { ...this.globalConfig, ...provider.config, MODEL_PROVIDER: providerType };
                 delete tempConfig.providerPools;
                 const service = getServiceAdapter(tempConfig);
-                const usage = typeof service.antigravityApiService?.getUsageLimits === 'function'
-                    ? await service.antigravityApiService.getUsageLimits()
+                const usage = typeof service.antigravityApiService?.getQuotaSummary === 'function'
+                    ? await service.antigravityApiService.getQuotaSummary()
                     : null;
                 const windows = extractQuotaWindows(usage);
                 provider.config.quotaWindows = windows;
                 provider.config.quotaWindowsUpdatedAt = Date.now();
                 this.accountScheduler.updateAccount(uuid, { uuid, ...windows });
+                this._log('info', `[Quota Refresh] ${reason} ${displayName}: ${this._formatQuotaWindows(windows)}`);
             } catch (error) {
-                this._log('warn', `Quota refresh failed for ${this._getDisplayName(provider.config)}: ${error.message}`);
+                this._log('warn', `[Quota Refresh] ${reason} failed for ${displayName}: ${error.message}`);
             } finally {
                 this.refreshingUuids.delete(uuid);
                 this.accountScheduler.setRefreshing(uuid, false);

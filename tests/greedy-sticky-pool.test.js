@@ -14,9 +14,13 @@ jest.mock('../src/providers/adapter.js', () => ({
 }));
 
 let ProviderPoolManager;
+let getServiceAdapter;
+let logger;
 
 beforeAll(async () => {
     ({ ProviderPoolManager } = await import('../src/providers/provider-pool-manager.js'));
+    ({ getServiceAdapter } = await import('../src/providers/adapter.js'));
+    logger = (await import('../src/utils/logger.js')).default;
 });
 
 const now = Date.now();
@@ -83,5 +87,31 @@ describe('optional greedy sticky pool selection', () => {
         }
         const fourth = await manager.acquireSlot('openai-custom', null, { sessionId: 'conversation-4' });
         expect(fourth.uuid).toBe('low');
+    });
+
+    test('startup queries quota once before any user request and records the result', async () => {
+        getServiceAdapter.mockClear();
+        logger.info.mockClear();
+        getServiceAdapter.mockImplementation(config => ({
+            antigravityApiService: {
+                getQuotaSummary: jest.fn(async () => ({
+                    groups: [{
+                        buckets: [
+                            { bucketId: 'gemini-weekly', remainingFraction: config.uuid === 'high' ? 0.9 : 0.2, resetTime: later(100) },
+                            { bucketId: 'gemini-5h', remainingFraction: 0.5, resetTime: later(60) }
+                        ]
+                    }]
+                }))
+            }
+        }));
+        const manager = pool('greedy-sticky');
+        manager.refreshQuotaOnStartup();
+        await new Promise(resolve => setTimeout(resolve, 20));
+
+        expect(manager.providerStatus['openai-custom'][0].config.quotaWindows.weekly.remainingFraction).toBeCloseTo(0.9);
+        expect(manager.providerStatus['openai-custom'][1].config.quotaWindows.weekly.remainingFraction).toBeCloseTo(0.2);
+        expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('[Quota Refresh] startup'));
+        expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('weekly 90%'));
+        expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('5h 50%'));
     });
 });

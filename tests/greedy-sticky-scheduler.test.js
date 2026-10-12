@@ -128,6 +128,7 @@ describe('greedy sticky assignment', () => {
     test('background quota refresh stops while idle and staggers accounts', () => {
         let clock = now;
         const gate = new GreedyStickyScheduler({ now: () => clock });
+        expect(gate.shouldRefresh('startup', { startup: true })).toBe(true);
         gate.noteUserRequest();
         expect(gate.shouldRefresh('a')).toBe(true);
         gate.markRefreshed('a');

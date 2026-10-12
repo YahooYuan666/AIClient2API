@@ -2088,6 +2088,31 @@ export class AntigravityApiService {
      * 获取模型配额信息 (返回原始 API 数据)
      * @returns {Promise<Object>} 原始配额信息
      */
+    async getQuotaSummary() {
+        if (!this.isInitialized) await this.initialize();
+
+        for (const baseURL of this.baseURLs) {
+            try {
+                const requestOptions = {
+                    url: `${baseURL}/${ANTIGRAVITY_API_VERSION}:retrieveUserQuotaSummary`,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'User-Agent': this.userAgent
+                    },
+                    responseType: 'json',
+                    body: JSON.stringify({})
+                };
+                this._applySidecar(requestOptions);
+                const res = await this.authClient.request(requestOptions);
+                if (res.data) return res.data;
+            } catch (error) {
+                logger.error(`[Antigravity] Failed to fetch quota summary from ${baseURL}:`, error.message);
+            }
+        }
+        throw new Error('Failed to fetch quota summary from all endpoints');
+    }
+
     async getUsageLimits() {
         if (!this.isInitialized) await this.initialize();
         

@@ -95,8 +95,8 @@ export class GreedyStickyScheduler {
         this.lastUserRequestAt = this.now();
     }
 
-    shouldRefresh(uuid) {
-        if (this.now() - this.lastUserRequestAt > IDLE_STOP_MS) return false;
+    shouldRefresh(uuid, { startup = false } = {}) {
+        if (!startup && this.now() - this.lastUserRequestAt > IDLE_STOP_MS) return false;
         const last = this.lastRefreshAt.get(uuid) || 0;
         return this.now() - last >= REFRESH_INTERVAL_MS;
     }
