@@ -4,7 +4,7 @@ import * as path from 'path';
 import * as http from 'http'; // Add http for IncomingMessage and ServerResponse types
 import * as crypto from 'crypto'; // Import crypto for MD5 hashing
 import logger from './logger.js';
-import { convertData, getOpenAIStreamChunkStop } from '../convert/convert.js';
+import { convertData, getOpenAIStreamChunkStop, releaseStreamState } from '../convert/convert.js';
 import { ProviderStrategyFactory } from './provider-strategies.js';
 import { getPluginManager } from '../core/plugin-manager.js';
 import { MODEL_PROTOCOL_PREFIX, MODEL_PROVIDER } from './constants.js';
@@ -525,7 +525,8 @@ export function getProtocolPrefix(provider) {
     // Special cases for OpenAI-compatible dedicated providers.
     if (provider === 'atlascloud' || provider.startsWith('atlascloud-') ||
         provider === 'qiniu' || provider.startsWith('qiniu-') ||
-        provider === 'fenno' || provider.startsWith('fenno-')) {
+        provider === 'fenno' || provider.startsWith('fenno-') ||
+        provider === 'github-copilot' || provider.startsWith('github-copilot-')) {
         return MODEL_PROTOCOL_PREFIX.OPENAI;
     }
 
@@ -877,11 +878,6 @@ export function createUpstreamResponseFailureError(providerLabel = 'Upstream', f
 function throwIfUpstreamResponseFailed(response, provider, providerLabel = provider) {
     const failure = classifyUpstreamResponseFailure(response, provider);
     if (failure) {
-        // 落盘被拦截的原始终止 chunk：MALFORMED 等终止块在转换/聚合前即被丢弃，
-        // 不记录的话日志里永远看不到模型实际吐出的函数调用内容，无法定位根因。
-        try {
-            logger.error(`[Upstream Raw Failure Chunk] provider=${provider} code=${failure.code} chunk=${JSON.stringify(response).slice(0, 4000)}`);
-        } catch (e) { /* 序列化失败不阻断主错误 */ }
         throw createUpstreamResponseFailureError(providerLabel, failure);
     }
 }
@@ -977,102 +973,17 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
     let hasToolCall = false;
     let hasMessageStop = false; // 跟踪是否已经发送过结束标志（message_stop / done）
-    let sawUpstreamFinish = false; // 上游是否已声明终止（原生 chunk 带 finishReason/finish_reason），与客户端协议无关
-
-    // [FIX claude stream protocol] Gemini→Claude 流式转换器输出的事件序列不完整：
-    // 缺 message_start、缺 thinking/text 块的 content_block_start、缺全部 content_block_stop，
-    // 且所有块共用 index:0 交错输出。严格解析 SSE 的客户端（如 ZCode）遇到非法序列会
-    // 判定流损坏并中断。此状态机在写出处把事件序列补全为合规的 Anthropic 流。
-    // 定义在 try 之外，供主转换循环和 finally 收尾（直接写 message_stop 处）共同使用。
-    const claudeStreamState = { started: false, nextIndex: 0, current: null, sawToolUse: false, stopReasonSeen: false };
-    const CLAUDE_DELTA_BLOCK = { thinking_delta: 'thinking', signature_delta: 'thinking', text_delta: 'text', input_json_delta: 'tool_use' };
-    const claudeStreamFix = (chunk, out) => {
-        const t = chunk?.type;
-        const isClaudeEvent = t === 'content_block_delta' || t === 'content_block_start'
-            || t === 'content_block_stop' || t === 'message_delta' || t === 'message_stop';
-        if (isClaudeEvent && !claudeStreamState.started) {
-            claudeStreamState.started = true;
-            out.push({
-                type: 'message_start',
-                message: {
-                    id: `msg_${Date.now().toString(36)}`,
-                    type: 'message', role: 'assistant', model: model,
-                    content: [], stop_reason: null, stop_sequence: null,
-                    usage: { input_tokens: 0, output_tokens: 0 }
-                }
-            });
-        }
-        if (t === 'content_block_delta') {
-            const blockType = CLAUDE_DELTA_BLOCK[chunk.delta?.type] || 'text';
-            if (blockType === 'tool_use') claudeStreamState.sawToolUse = true;
-            if (!claudeStreamState.current || claudeStreamState.current.type !== blockType) {
-                if (claudeStreamState.current) {
-                    out.push({ type: 'content_block_stop', index: claudeStreamState.current.index });
-                }
-                const idx = claudeStreamState.nextIndex++;
-                claudeStreamState.current = { type: blockType, index: idx };
-                // [FIX] Anthropic 协议要求块骨架携带同名字段（ZCode 按此校验）：
-                // thinking 块须含 thinking:""，text 块须含 text:""，缺失会被 zod 判 invalid_type
-                out.push({
-                    type: 'content_block_start',
-                    index: idx,
-                    content_block: blockType === 'tool_use'
-                        ? { type: 'tool_use', id: `toolu_${Date.now().toString(36)}`, name: '', input: {} }
-                        : blockType === 'thinking'
-                            ? { type: 'thinking', thinking: '' }
-                            : { type: 'text', text: '' }
-                });
-            }
-            chunk.index = claudeStreamState.current.index;
-            out.push(chunk);
-            return;
-        }
-        if (t === 'content_block_start') {
-            if (claudeStreamState.current) {
-                out.push({ type: 'content_block_stop', index: claudeStreamState.current.index });
-                claudeStreamState.current = null;
-            }
-            if (chunk.content_block?.type === 'tool_use') claudeStreamState.sawToolUse = true;
-            const idx = claudeStreamState.nextIndex++;
-            if (chunk.content_block) chunk.index = idx;
-            claudeStreamState.current = { type: chunk.content_block?.type || 'text', index: idx };
-            out.push(chunk);
-            return;
-        }
-        if (t === 'message_delta') {
-            if (chunk.delta?.stop_reason) claudeStreamState.stopReasonSeen = true;
-            if (claudeStreamState.current) {
-                out.push({ type: 'content_block_stop', index: claudeStreamState.current.index });
-                claudeStreamState.current = null;
-            }
-            out.push(chunk);
-            return;
-        }
-        if (t === 'message_stop') {
-            if (claudeStreamState.current) {
-                out.push({ type: 'content_block_stop', index: claudeStreamState.current.index });
-                claudeStreamState.current = null;
-            }
-            if (!claudeStreamState.stopReasonSeen) {
-                out.push({
-                    type: 'message_delta',
-                    delta: { stop_reason: claudeStreamState.sawToolUse ? 'tool_use' : 'end_turn' },
-                    usage: { output_tokens: 0 }
-                });
-                claudeStreamState.stopReasonSeen = true;
-            }
-            out.push(chunk);
-            return;
-        }
-        out.push(chunk);
-    };
+    // finally 必须能访问这两个值：客户端 close、上游 throw 和无终止块 EOF 都要释放状态。
+    // generateContentStream 初始化失败前 streamRequestId 仍为空，安全跳过清理。
+    let needsConversion = false;
+    let streamRequestId = null;
 
     try {
         // fs.writeFile('request'+Date.now()+'.json', JSON.stringify(requestBody));
         // The service returns a stream in its native format (toProvider).
-        const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
+        needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
         requestBody.model = model;
-        let nativeStream = await service.generateContentStream(model, requestBody);
+        const nativeStream = await service.generateContentStream(model, requestBody);
         
         // 如果提供者内部发生了模型回退（如 Antigravity 自动降级），同步更新本地 model 变量
         // 这确保了后续的监控钩子和统计插件记录的是实际使用的模型
@@ -1080,57 +991,23 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             model = requestBody.model;
         }
         const addEvent = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.CLAUDE || getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES;
-        // 为每个请求生成唯一 ID，用于在单例 converter 中隔离并发流状态
-        const streamRequestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        // 为每个请求生成唯一 ID，用于在单例 converter 中隔离并发流状态。
+        streamRequestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
-        // [FIX mid-stream invisible retry] 可重试的上游终止失败（如 MALFORMED_FUNCTION_CALL：模型吐出空函数调用）
-        // 可能发生在思考内容已流式发给客户端之后。此时 anyDataSent 守卫会放弃重试并把错误帧发给客户端，
-        // 严格解析的客户端（如 ZCode）整轮报 "Model request failed"，只能人工重发。
-        // 改为：对上游做同凭证、同请求体的隐式重试，新响应的 chunk 继续写入同一客户端流——
-        // converter 流状态按 streamRequestId 延续（chunk id 不变、tool_calls index 续接），
-        // Claude 状态机沿用同一 message，客户端表现为前后两段推理 + 正常收尾，整轮不失败。
-        const MID_STREAM_RETRY_MAX = 2;
-        let midStreamRetryCount = 0;
-
-        while (true) {
-        let retrySignal = null;
-        let clientGone = false;
-            for await (const nativeChunk of nativeStream) {
-                // 检查客户端是否已断开连接
-                if (clientDisconnected.value) {
-                    logger.info('[Stream] Stopping iteration due to client disconnect');
-                    clientGone = true;
-                    break;
-                }
-
-                // 上游原生终止信号（协议无关）：claude 格式的 message_stop 由 finally 收尾合成，
-                // 循环内永远看不到，不能用客户端帧判断本次尝试是否"异常截断"。
-                if (nativeChunk?.candidates?.some(c => c?.finishReason) || nativeChunk?.choices?.some(c => c?.finish_reason)) {
-                    sawUpstreamFinish = true;
-                }
+        for await (const nativeChunk of nativeStream) {
+            // 检查客户端是否已断开连接
+            if (clientDisconnected.value) {
+                logger.info('[Stream] Stopping iteration due to client disconnect');
+                break;
+            }
             
             // 由协议策略识别原生终止失败；必须在转换和写入客户端之前抛出，
             // 才能安全重试且不会把失败伪装成成功的结束帧。
-            try {
-                throwIfUpstreamResponseFailed(
-                    nativeChunk,
-                    toProvider,
-                    customName ? `${toProvider}/${customName}` : toProvider
-                );
-            } catch (classificationError) {
-                // 已发送部分数据时不再直接判死：标记重试信号，交给 while 外层做同请求隐式重试
-                if (
-                    classificationError.isRetryableUpstreamResponseFailure
-                    && anyDataSent
-                    && !clientDisconnected.value
-                    && !hasMessageStop
-                    && midStreamRetryCount < MID_STREAM_RETRY_MAX
-                ) {
-                    retrySignal = classificationError;
-                    break;
-                }
-                throw classificationError;
-            }
+            throwIfUpstreamResponseFailed(
+                nativeChunk,
+                toProvider,
+                customName ? `${toProvider}/${customName}` : toProvider
+            );
 
             // Extract text for logging purposes
             const chunkText = extractResponseText(nativeChunk, toProvider);
@@ -1166,16 +1043,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             // 处理 chunkToSend 可能是数组或对象的情况
             const chunksToSend = Array.isArray(chunkToSend) ? chunkToSend : [chunkToSend];
 
-            // [FIX claude stream protocol] 输出为 Claude 协议时先补全事件序列
-            let outChunks = chunksToSend;
-            if (addEvent && getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.CLAUDE) {
-                outChunks = [];
-                for (const c of chunksToSend) {
-                    claudeStreamFix(c, outChunks);
-                }
-            }
-
-            for (const chunk of outChunks) {
+            for (const chunk of chunksToSend) {
                 // 再次检查客户端连接状态
                 if (clientDisconnected.value) {
                     break;
@@ -1254,35 +1122,6 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 }
                 // logger.info(`data: ${JSON.stringify(chunk)}\n`);
             }
-        }
-
-        if (clientGone) break;
-
-            // 终止帧缺失兜底：上游直到流结束都没声明终止（异常截断/空流）。
-            // 注意用上游原生信号 sawUpstreamFinish 而非客户端帧 hasMessageStop——
-            // claude 格式的终止帧由 finally 合成，循环内不可见，误用会导致每个正常流都被判为截断。
-            if (!retrySignal && !sawUpstreamFinish && anyDataSent && !clientDisconnected.value
-                && midStreamRetryCount < MID_STREAM_RETRY_MAX) {
-            retrySignal = {
-                isRetryableUpstreamResponseFailure: true,
-                responseFailureCode: 'TRUNCATED_STREAM',
-                responseFailureLabel: 'stream ended without a terminal frame'
-            };
-        }
-
-        if (!retrySignal) break;
-
-        midStreamRetryCount += 1;
-        logger.warn(`[Stream Retry] ${retrySignal.responseFailureCode || retrySignal.responseFailureLabel || 'retryable failure'} after data already sent to client. Retrying the same upstream request invisibly (${midStreamRetryCount}/${MID_STREAM_RETRY_MAX})...`);
-        const retryDelayMs = CONFIG?.EMPTY_RESPONSE_RETRY_DELAY_MS ?? 500;
-        if (retryDelayMs > 0) {
-            await new Promise(resolve => setTimeout(resolve, retryDelayMs));
-        }
-        requestBody.model = model;
-        nativeStream = await service.generateContentStream(model, requestBody);
-        if (requestBody.model && requestBody.model !== model) {
-            model = requestBody.model;
-        }
         }
 
         // 上游流正常结束但一个字节都没发给客户端：这是「静默空响应」，不能算成功。
@@ -1481,6 +1320,14 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
         responseClosed = true;
     } finally {
+        // 单例转换器中的 Gemini → OpenAI 状态不能只依赖上游 finishReason 清理。
+        // 客户端 close、上游 throw、无终止块 EOF 都会绕过转换器的正常终止分支。
+        // 状态保存在“来源协议”的转换器内：Gemini → OpenAI 时必须释放 GeminiConverter，
+        // 不能传客户端 fromProvider（OpenAI）或未归一化的 provider 名。
+        if (needsConversion && streamRequestId) {
+            releaseStreamState(getProtocolPrefix(toProvider), streamRequestId);
+        }
+
         // 释放并发插槽
         if (providerPoolManager && pooluuid) {
             providerPoolManager.releaseSlot(toProvider, pooluuid);
@@ -1508,14 +1355,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                         // 连接关闭即表示流结束；不要再追加 `event: done` + `data: {}`，否则会触发下游类型校验失败（AI_TypeValidationError）。
                     } else if (clientProtocol === MODEL_PROTOCOL_PREFIX.CLAUDE) {
                         if (!hasMessageStop) {
-                            // [FIX claude stream protocol] 收尾的 message_stop 也走状态机，
-                            // 补齐最后一个 content_block_stop 与缺失的 stop_reason（message_delta）
-                            const closingChunks = [];
-                            claudeStreamFix({ type: 'message_stop' }, closingChunks);
-                            for (const c of closingChunks) {
-                                res.write(`event: ${c.type}\n`);
-                                res.write(`data: ${JSON.stringify(c)}\n\n`);
-                            }
+                            res.write('event: message_stop\n');
+                            res.write('data: {"type":"message_stop"}\n\n');
                             hasMessageStop = true;
                         }
                     } else if (clientProtocol === MODEL_PROTOCOL_PREFIX.GEMINI) {

@@ -3,6 +3,8 @@ const GPT_EFFORT_LEVELS = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'ma
 // Kiro only accepts additionalModelRequestFields for models whose schema exposes
 // effort controls. Older Claude 4.5/Haiku models reject the whole field with 400.
 const CLAUDE_EFFORT_LEVELS = new Map([
+    ['claude-opus-5.5', new Set(['low', 'medium', 'high', 'xhigh', 'max'])],
+    ['claude-sonnet-5.5', new Set(['low', 'medium', 'high', 'xhigh', 'max'])],
     ['claude-opus-5', new Set(['low', 'medium', 'high', 'xhigh', 'max'])],
     ['claude-opus-4.8', new Set(['low', 'medium', 'high', 'xhigh', 'max'])],
     ['claude-opus-4.7', new Set(['low', 'medium', 'high', 'xhigh', 'max'])],

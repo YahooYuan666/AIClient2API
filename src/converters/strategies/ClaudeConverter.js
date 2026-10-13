@@ -876,11 +876,6 @@ export class ClaudeConverter extends BaseConverter {
             contents: []
         };
 
-        // [FIX image cap] 单次请求最多保留最近 N 张工具结果图片（超出则丢弃最早的）。
-        // 客户端会把历史工具结果（含图片）累积重发，一次几十张图会超上游视觉上限，
-        // 模型将静默忽略全部图片；只保留最近几张可保证新读的图始终可见。
-        const toolResultImageBudget = { max: 5, used: 0, dropped: 0, queue: [] };
-
         // 处理系统指令 - 支持数组和字符串格式
         if (claudeRequest.system) {
             if (Array.isArray(claudeRequest.system)) {
@@ -1055,27 +1050,31 @@ export class ClaudeConverter extends BaseConverter {
                                         // [FIX tool_result images] 提取 base64 图片块转为 Gemini inlineData part。
                                         // 原逻辑把整个数组 JSON.stringify 成文本（图片数据变成乱码字符串，
                                         // 视觉模型因此"看不见"工具返回的截图，客户端表现为静默空回合）。
+                                        // [FIX tool_result images] 记录哪些 item 真的被转成了 inlineData。
+                                        // 只有转换成功的才从 fallback 里剔除——URL 来源的图片无法转换，
+                                        // 必须原样保留（Anthropic 的 ImageBlockParam 允许
+                                        // source.type='url'），否则只有 URL 图片的 tool_result 会
+                                        // 被静默清空成 result='[]'。
+                                        const convertedImageItems = new Set();
                                         for (const item of responseData) {
                                             if (item && item.type === 'image' && item.source?.type === 'base64' && item.source.data) {
-                                                // [FIX image cap] 单次请求图片数超过上限时，丢弃最早的图片，
-                                                // 只保留最近的若干张。客户端会把全部历史工具结果（含图片）累积重发，
-                                                // 一次携带几十张图片会超出上游视觉处理上限，模型将静默忽略所有图片。
-                                                if (toolResultImageBudget.used >= toolResultImageBudget.max) {
-                                                    toolResultImageBudget.queue[toolResultImageBudget.queue.length - toolResultImageBudget.max].omitted = true;
-                                                    toolResultImageBudget.dropped++;
-                                                }
-                                                const imagePart = {
+                                                imageParts.push({
                                                     inlineData: {
                                                         mimeType: item.source.media_type || 'image/jpeg',
                                                         data: item.source.data
                                                     }
-                                                };
-                                                imageParts.push(imagePart);
-                                                toolResultImageBudget.queue.push(imagePart);
-                                                toolResultImageBudget.used++;
+                                                });
+                                                convertedImageItems.add(item);
                                             }
                                         }
-                                        responseData = textParts || JSON.stringify(responseData.filter(item => !(item && item.type === 'image')));
+                                        const remaining = responseData.filter(item => !convertedImageItems.has(item));
+                                        const remainingText = remaining
+                                            .filter(item => item && item.type === 'text')
+                                            .map(item => item.text)
+                                            .join('\n');
+                                        // remaining 里已经不含成功转换的 base64 图片，
+                                        // 但仍保留 URL 图片等未转换内容，不静默丢弃。
+                                        responseData = remainingText || JSON.stringify(remaining);
                                     } else if (typeof responseData !== 'string') {
                                         responseData = JSON.stringify(responseData);
                                     }
@@ -1157,18 +1156,9 @@ export class ClaudeConverter extends BaseConverter {
             geminiRequest.generationConfig = generationConfig;
         }
 
-        // [FIX image cap] 超出上限的最早图片替换为占位文本（保留请求结构合法，模型可感知图片被省略）
-        if (toolResultImageBudget.dropped > 0) {
-            for (const imagePart of toolResultImageBudget.queue.slice(0, toolResultImageBudget.dropped)) {
-                if (imagePart.omitted) {
-                    delete imagePart.inlineData;
-                    imagePart.text = '[Earlier image omitted: too many images in one request. Re-read the file if you need to see it again.]';
-                }
-            }
-            logger.info(`[Image Cap] Kept the ${toolResultImageBudget.max} most recent tool-result images, omitted ${toolResultImageBudget.dropped} earlier ones.`);
-        }
-
         // 处理工具 - 使用 parametersJsonSchema 格式
+        const declaredFunctionNames = new Set();
+        const disableNativeTools = claudeRequest.tool_choice?.type === 'none';
         if (Array.isArray(claudeRequest.tools) && claudeRequest.tools.length > 0) {
             const functionDeclarations = [];
             let googleSearchTool = null;
@@ -1187,26 +1177,32 @@ export class ClaudeConverter extends BaseConverter {
                 // Anthropic 的 max_uses/allowed_domains/blocked_domains/user_location 与 Gemini grounding
                 // 参数不同构，先只透传能力本身。
                 if (typeof tool.type === 'string' && tool.type.startsWith('web_search')) {
-                    googleSearchTool = googleSearchTool || {};
+                    if (!disableNativeTools) {
+                        googleSearchTool = googleSearchTool || {};
+                    }
                     return;
                 }
 
-                // 处理 google_search 扩展
-                if (tool.google_search) {
-                    googleSearchTool = tool.google_search;
+                // functionCallingConfig.mode=NONE 只禁用函数调用，因此 tool_choice=none 时
+                // 必须直接移除不受该配置约束的 Gemini 原生服务端工具。这些工具也不能
+                // 同时落入 FunctionDeclaration，否则显式 tool_choice 会再次生成无效配置。
+                const isNativeTool = Boolean(tool.google_search || tool.url_context || tool.googleMaps);
+                if (isNativeTool) {
+                    if (!disableNativeTools) {
+                        if (tool.google_search) {
+                            googleSearchTool = tool.google_search;
+                        }
+                        if (tool.url_context) {
+                            urlContextTool = tool.url_context;
+                        }
+                        if (tool.googleMaps) {
+                            googleMapsTool = tool.googleMaps;
+                        }
+                    }
+                    return;
                 }
 
-                // 处理 url_context 扩展
-                if (tool.url_context) {
-                    urlContextTool = tool.url_context;
-                }
-
-                // 处理 google_maps 扩展
-                if (tool.googleMaps) {
-                    googleMapsTool = tool.googleMaps;
-                }
-
-                // 如果没有名称且不是上述扩展，则跳过函数处理
+                // 如果没有名称，则跳过函数处理
                 if (!tool.name) {
                     logger.warn("Skipping unnamed tool declaration in claudeRequest.tools.");
                     return;
@@ -1234,6 +1230,7 @@ export class ClaudeConverter extends BaseConverter {
                 }
                 
                 functionDeclarations.push(funcDecl);
+                declaredFunctionNames.add(funcDecl.name);
             });
             
             if (functionDeclarations.length > 0 || googleSearchTool || urlContextTool || googleMapsTool) {
@@ -1255,7 +1252,10 @@ export class ClaudeConverter extends BaseConverter {
 
         // 处理tool_choice
         if (claudeRequest.tool_choice) {
-            geminiRequest.toolConfig = this.buildGeminiToolConfigFromClaude(claudeRequest.tool_choice);
+            geminiRequest.toolConfig = this.buildGeminiToolConfigFromClaude(
+                claudeRequest.tool_choice,
+                declaredFunctionNames
+            );
         }
 
         // 添加默认安全设置
@@ -1632,7 +1632,7 @@ export class ClaudeConverter extends BaseConverter {
     /**
      * 构建Gemini工具配置
      */
-    buildGeminiToolConfigFromClaude(claudeToolChoice) {
+    buildGeminiToolConfigFromClaude(claudeToolChoice, declaredFunctionNames = null) {
         if (!claudeToolChoice || typeof claudeToolChoice !== 'object' || !claudeToolChoice.type) {
             logger.warn("Invalid claudeToolChoice provided.");
             return undefined;
@@ -1645,6 +1645,12 @@ export class ClaudeConverter extends BaseConverter {
                 return { functionCallingConfig: { mode: 'NONE' } };
             case 'tool':
                 if (claudeToolChoice.name && typeof claudeToolChoice.name === 'string') {
+                    if (declaredFunctionNames && !declaredFunctionNames.has(claudeToolChoice.name)) {
+                        throw new Error(
+                            `Gemini cannot force tool '${claudeToolChoice.name}' because it has no matching ` +
+                            "FunctionDeclaration. Native server-side tools require automatic selection."
+                        );
+                    }
                     return { 
                         functionCallingConfig: { 
                             mode: 'ANY', 

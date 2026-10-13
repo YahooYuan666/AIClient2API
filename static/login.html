@@ -114,6 +114,21 @@
             display: block;
         }
 
+        .first-login-hint {
+            margin: -4px 0 18px;
+            padding: 10px 12px;
+            border: 1px solid #a7f3d0;
+            border-radius: 8px;
+            background: #ecfdf5;
+            color: #047857;
+            font-size: 12px;
+            line-height: 1.5;
+        }
+
+        .first-login-hint i {
+            margin-right: 5px;
+        }
+
         .login-button {
             width: 100%;
             padding: 12px;
@@ -206,6 +221,11 @@
                     required
                 >
                 <div class="error-message" id="errorMessage" data-i18n="login.error.incorrect">密码错误，请重试</div>
+            </div>
+
+            <div class="first-login-hint">
+                <i class="fas fa-circle-info"></i>
+                <span data-i18n="login.initialPasswordHint">首次部署？初始密码已输出到服务启动日志；Docker 用户请运行 docker logs 查看。</span>
             </div>
 
             <button type="submit" class="login-button" id="loginButton" data-i18n="login.button">

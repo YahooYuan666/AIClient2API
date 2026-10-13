@@ -175,7 +175,6 @@
       <a href="https://www.axisnow.io">AxisNow</a> は、中国本土と世界各地のアクセス体験を両立しながら、Web サイトや API を保護・高速化します。さらにクライアント SDK を通じて、高速化とセキュリティ機能をネイティブ／モバイルアプリにも拡張します — <strong>セルフホスト型プライベート CDN｜サブスクリプション型 DDoS 防御 CDN｜自主管理でき、柔軟に組み合わせ可能な CDN ネットワーク。</strong>
     </td>
   </tr>
-<!-- RunningHub
   <tr>
     <td width="25%" align="center" valign="middle">
       <a href="https://www.runninghub.ai/call-api?source=github">
@@ -189,7 +188,6 @@
       <small style="color: #666;">RunningHub の割引や無料トライアルについては、<a href="mailto:zhenyuedong@haima.me">zhenyuedong@haima.me</a> までお問い合わせください。</small>
     </td>
   </tr>
--->
   <tr>
     <td width="25%" align="center" valign="middle">
       <img src="static/wechat.png" alt="Sponsor Contact" width="150">
@@ -357,7 +355,25 @@ docker compose up -d
 サーバー起動後、ブラウザで以下にアクセスしてください：
 👉 [**http://localhost:3000**](http://localhost:3000)
 
-> **デフォルトパスワード**: `admin123` (ログイン後、コンソールまたは `pwd` ファイルの変更で変更可能)
+> **初期パスワード**：初回起動時にランダムなパスワードが生成され、次のログに出力されます。すぐに安全な場所へ保存してください。ログイン後、管理画面で変更できます。
+>
+> ```text
+> [Auth] Initial admin password: <ランダムパスワード>
+> ```
+>
+> - `npm start` で実行した場合：起動したターミナルで確認します。
+> - Docker Compose の場合：`docker logs aiclient2api 2>&1 | grep "Initial admin password"` を実行します。
+> - デフォルトのログファイル：`logs/app-YYYY-MM-DD.log`。
+>
+> `configs/pwd` には PBKDF2 ハッシュのみが保存され、平文パスワードを復元することはできません。初期パスワードを確認できなかった場合は、サービスを停止して `configs/pwd` を削除し、再起動して新しいパスワードを生成してください。
+>
+> ```bash
+> # Linux/macOS
+> rm configs/pwd
+>
+> # Windows PowerShell
+> Remove-Item configs/pwd
+> ```
 
 #### 3. ビジュアル設定 (推奨)
 **「設定管理」** ページに入ると、以下を直接行えます：
@@ -417,7 +433,7 @@ docker compose up -d
 
 **📜 リアルタイムログ**：システムログとリクエストログのライブ表示、管理コントロール付き
 
-**🔐 ログイン認証**：デフォルトパスワード `admin123`、`pwd`ファイルで変更可能
+**🔐 ログイン認証**：初回起動時に固有のランダムパスワードを生成してコンソール／ログに表示し、管理画面で変更可能
 
 アクセス：`http://localhost:3000` → ログイン → サイドバーナビゲーション → 即座有効
 

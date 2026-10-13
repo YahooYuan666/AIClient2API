@@ -11,6 +11,7 @@ import { updateUsageProviderConfigs } from './usage-manager.js';
 import { updateConfigProviderConfigs } from './config-manager.js';
 import { loadConfigList, updateProviderFilterOptions } from './upload-config-manager.js';
 import { setServiceMode } from './event-handlers.js';
+import { createCopilotQuotaUsageLoader } from './copilot-quota-summary.js';
 
 // 保存初始服务器时间和运行时间
 let initialServerTime = null;
@@ -19,6 +20,7 @@ let initialLoadTime = null;
 let isStaticProviderConfigsUpdated = false;
 let cachedSupportedProviders = null;
 let latestProvidersAccessInfo = null;
+const loadCopilotQuotaUsage = createCopilotQuotaUsageLoader({ apiClient: window.apiClient });
 
 function navigateToSection(sectionId) {
     const navItem = document.querySelector(`.nav-item[data-section="${sectionId}"]`);
@@ -456,6 +458,11 @@ function renderProviders(providers, supportedProviders = []) {
                     <span class="provider-stat-label" data-i18n="providers.stat.errorCount">${t('providers.stat.errorCount')}</span>
                     <span class="provider-stat-value">${errorCount}</span>
                 </div>
+                ${providerType === 'github-copilot' ? `
+                <div class="provider-stat copilot-quota-stat" title="${t('providers.copilotQuota.summaryTitle')}">
+                    <span class="provider-stat-label" data-i18n="providers.stat.copilotQuotaUsed">${t('providers.stat.copilotQuotaUsed')}</span>
+                    <span class="provider-stat-value copilot-quota-stat-value">${t('providers.copilotQuota.loading')}</span>
+                </div>` : ''}
             </div>
         `;
 
@@ -471,6 +478,16 @@ function renderProviders(providers, supportedProviders = []) {
         });
 
         container.appendChild(providerDiv);
+
+        if (providerType === 'github-copilot') {
+            const quotaValue = providerDiv.querySelector('.copilot-quota-stat-value');
+            loadCopilotQuotaUsage(accounts).then(result => {
+                if (!quotaValue) return;
+                quotaValue.textContent = result.available
+                    ? `${Math.round(result.usedPercent)}% / ${Math.round(result.totalPercent)}%`
+                    : t('providers.copilotQuota.unavailable');
+            });
+        }
         
         // 为添加分组按钮添加事件监听
         const addGroupBtn = providerDiv.querySelector('.add-group-btn');
@@ -532,6 +549,14 @@ function renderProviders(providers, supportedProviders = []) {
             authBtn.addEventListener('click', (e) => {
                 e.stopPropagation(); // 阻止事件冒泡到父元素
                 handleGenerateAuthUrl(providerType);
+            });
+        }
+
+        const addCopilotPatBtn = providerDiv.querySelector('.add-github-copilot-pat-btn');
+        if (addCopilotPatBtn) {
+            addCopilotPatBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                showAddGitHubCopilotPatModal();
             });
         }
 
@@ -768,6 +793,15 @@ async function openProviderManager(providerType, searchTerm = '') {
  * @returns {string} 授权按钮HTML
  */
 function generateAuthButton(providerType) {
+    if (providerType === 'github-copilot') {
+        return `
+            <button class="add-github-copilot-pat-btn" title="${t('githubCopilot.addPat')}" data-i18n-title="githubCopilot.addPat">
+                <i class="fas fa-key"></i>
+                <span data-i18n="githubCopilot.addPat">${t('githubCopilot.addPat')}</span>
+            </button>
+        `;
+    }
+
     // 只为支持OAuth或批量导入的提供商显示授权按钮
     const oauthProviders = ['gemini-cli-oauth', 'gemini-antigravity', 'openai-qwen-oauth', 'claude-kiro-oauth', 'openai-iflow', 'openai-codex-oauth', 'grok-cli-oauth', 'grok-web'];
 
@@ -791,6 +825,77 @@ function generateAuthButton(providerType) {
             <span data-i18n="providers.auth.generate">${t('providers.auth.generate')}</span>
         </button>
     `;
+}
+
+function showAddGitHubCopilotPatModal() {
+    const modal = document.createElement('div');
+    modal.className = 'modal-overlay';
+    modal.style.display = 'flex';
+    modal.innerHTML = `
+        <div class="modal-content" style="max-width: 520px;">
+            <div class="modal-header">
+                <h3><i class="fas fa-key"></i> <span data-i18n="githubCopilot.addPat">${t('githubCopilot.addPat')}</span></h3>
+                <button class="modal-close" aria-label="${t('modal.provider.cancel')}">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="githubCopilotPatName" data-i18n="githubCopilot.accountName">${t('githubCopilot.accountName')}</label>
+                    <input id="githubCopilotPatName" type="text" autocomplete="off">
+                </div>
+                <div class="form-group">
+                    <label for="githubCopilotPatToken" data-i18n="githubCopilot.patLabel">${t('githubCopilot.patLabel')}</label>
+                    <input id="githubCopilotPatToken" type="password" autocomplete="new-password" spellcheck="false" placeholder="github_pat_...">
+                    <small data-i18n="githubCopilot.patHint">${t('githubCopilot.patHint')}</small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-cancel" data-i18n="modal.provider.cancel">${t('modal.provider.cancel')}</button>
+                <button class="modal-submit"><i class="fas fa-plus"></i> <span data-i18n="common.confirm">${t('common.confirm')}</span></button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    const closeModal = () => modal.remove();
+    modal.querySelector('.modal-close').addEventListener('click', closeModal);
+    modal.querySelector('.modal-cancel').addEventListener('click', closeModal);
+    modal.querySelector('.modal-submit').addEventListener('click', async (event) => {
+        const tokenInput = modal.querySelector('#githubCopilotPatToken');
+        const token = tokenInput.value.trim();
+        if (!token.startsWith('github_pat_')) {
+            showToast(t('common.warning'), t('githubCopilot.invalidPat'), 'warning');
+            tokenInput.focus();
+            return;
+        }
+
+        const submitButton = event.currentTarget;
+        submitButton.disabled = true;
+        try {
+            const accountName = modal.querySelector('#githubCopilotPatName').value.trim();
+            const safeAccountName = accountName.replace(/[^a-zA-Z0-9 .@+-]/g, '').slice(0, 80);
+            const response = await window.apiClient.post('/providers', {
+                providerType: 'github-copilot',
+                providerConfig: {
+                    customName: safeAccountName || `GitHub Copilot ${Date.now()}`,
+                    GITHUB_COPILOT_API_KEY: token,
+                    GITHUB_COPILOT_BASE_URL: 'https://api.githubcopilot.com',
+                    isHealthy: true,
+                    isDisabled: false
+                }
+            });
+            if (!response.success) {
+                throw new Error(response.error?.message || 'Failed to add GitHub Copilot token');
+            }
+
+            closeModal();
+            showToast(t('common.success'), t('githubCopilot.patAdded'), 'success');
+            await loadProviders(true);
+            setTimeout(() => openProviderManager('github-copilot'), 500);
+        } catch (error) {
+            showToast(t('common.error'), error.message, 'error');
+            submitButton.disabled = false;
+        }
+    });
 }
 
 /**

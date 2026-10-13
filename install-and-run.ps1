@@ -66,6 +66,11 @@ Write-Host "  Starting AIClient2API Server..." -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
 Write-Host "Server will start at http://localhost:3000"
 Write-Host "Press Ctrl+C to stop the server"
+if (-not (Test-Path "configs\pwd") -or (Get-Item "configs\pwd").Length -eq 0) {
+    Write-Host ""
+    Write-Host "[IMPORTANT] First deployment detected. Save the generated admin password shown below:" -ForegroundColor Yellow
+    Write-Host "            [Auth] Initial admin password: ..." -ForegroundColor Yellow
+}
 Write-Host ""
 
 node src\core\master.js

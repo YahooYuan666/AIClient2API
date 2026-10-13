@@ -59,12 +59,15 @@ export const PROVIDER_MODELS = {
         'gemini-3.5-flash-high',
         'gemini-3.6-flash',
         'gemini-3.6-flash-low',
+        'gemini-3.6-flash-medium',
         'gemini-3.6-flash-high',
         'gemini-3.7-flash',
         'gemini-3.7-flash-low',
+        'gemini-3.7-flash-medium',
         'gemini-3.7-flash-high',
         'gemini-3.8-flash',
         'gemini-3.8-flash-low',
+        'gemini-3.8-flash-medium',
         'gemini-3.8-flash-high',
         'gemini-3.1-pro-low',
         'gemini-3.1-pro-high',
@@ -74,6 +77,7 @@ export const PROVIDER_MODELS = {
         'gemini-2.5-flash-thinking',
         'gemini-claude-sonnet-4-6',
         'gemini-claude-opus-4-6-thinking',
+        'gpt-oss-120b-medium',
     ],
     'claude-custom': [],
     'claude-kiro-oauth': [
@@ -82,6 +86,8 @@ export const PROVIDER_MODELS = {
         'gpt-5.6-luna',
         'claude-haiku-4-5',
         'claude-haiku-4-5-20251001',
+        'claude-opus-5-5',
+        'claude-sonnet-5-5',
         'claude-sonnet-5',
         'claude-opus-5',
         'claude-opus-4-8',
@@ -176,6 +182,10 @@ export const PROVIDER_MODELS = {
         'grok-imagine-1.0-edit',
         'grok-imagine-1.0-fast',
         'grok-imagine-1.0-fast-edit',
+    ],
+    'github-copilot': [
+        'gpt-4.1',
+        'auto'
     ]
 };
 
@@ -185,7 +195,8 @@ export const MANAGED_MODEL_LIST_PROVIDERS = [
     'claude-custom',
     'atlascloud',
     'qiniu',
-    'fenno'
+    'fenno',
+    'github-copilot'
 ];
 
 export function getManagedModelListProviderType(providerType) {

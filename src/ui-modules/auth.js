@@ -1,4 +1,4 @@
-import { atomicWriteFile } from '../utils/file-lock.js';
+import { atomicWriteFile, withFileLock } from '../utils/file-lock.js';
 import { existsSync } from 'fs';
 import logger from '../utils/logger.js';
 import { promises as fs } from 'fs';
@@ -10,46 +10,68 @@ import { PASSWORD } from '../utils/constants.js';
 
 // Token存储到本地文件中
 const TOKEN_STORE_FILE = path.join(process.cwd(), 'configs', 'token-store.json');
+const INITIAL_PASSWORD_BYTES = 24;
+
+async function hashPassword(password) {
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = await new Promise((resolve, reject) =>
+        crypto.pbkdf2(password, salt, PASSWORD.PBKDF2_ITERATIONS, PASSWORD.PBKDF2_KEYLEN, PASSWORD.PBKDF2_DIGEST, (err, key) =>
+            err ? reject(err) : resolve(key.toString('hex'))
+        )
+    );
+    return `pbkdf2:${salt}:${hash}`;
+}
 
 /**
- * 默认密码（当pwd文件不存在时使用）
+ * 确保管理员密码文件存在。首次启动时生成随机密码，只将哈希写入磁盘，
+ * 并将明文初始密码输出到控制台/日志一次。
  */
-const DEFAULT_PASSWORD = 'admin123';
-
-/**
- * 读取密码文件内容
- * 如果文件不存在或读取失败，返回默认密码
- */
-export async function readPasswordFile() {
-    const pwdFilePath = path.join(process.cwd(), 'configs', 'pwd');
-    try {
-        // 使用异步方式检查文件是否存在并读取，避免竞态条件
-        const password = await fs.readFile(pwdFilePath, 'utf8');
-        const trimmedPassword = password.trim();
-        // 如果密码文件为空，使用默认密码
-        if (!trimmedPassword) {
-            logger.info('[Auth] Password file is empty, using default password: ' + DEFAULT_PASSWORD);
-            return DEFAULT_PASSWORD;
+export async function initializeAdminPassword(pwdFilePath = path.join(process.cwd(), 'configs', 'pwd')) {
+    return withFileLock(pwdFilePath, async () => {
+        try {
+            const storedPassword = (await fs.readFile(pwdFilePath, 'utf8')).trim();
+            if (storedPassword) {
+                return storedPassword;
+            }
+            logger.warn('[Auth] Password file is empty; generating a new initial admin password.');
+        } catch (error) {
+            if (error.code !== 'ENOENT') {
+                throw new Error(`Unable to read admin password file: ${error.message}`);
+            }
         }
-        logger.info('[Auth] Successfully read password file');
-        return trimmedPassword;
-    } catch (error) {
-        // ENOENT means file does not exist, which is normal
-        if (error.code === 'ENOENT') {
-            logger.info('[Auth] Password file does not exist, using default password: ' + DEFAULT_PASSWORD);
+
+        await fs.mkdir(path.dirname(pwdFilePath), { recursive: true });
+        const initialPassword = crypto.randomBytes(INITIAL_PASSWORD_BYTES).toString('base64url');
+        const storedPassword = await hashPassword(initialPassword);
+        await atomicWriteFile(pwdFilePath, storedPassword, { encoding: 'utf-8', mode: 0o600 });
+
+        logger.warn('============================================================');
+        logger.warn('[Auth] FIRST STARTUP: a random admin password was generated.');
+        logger.warn('[Auth] Save it now. It is only emitted during this initialization.');
+        const passwordMessage = `[Auth] Initial admin password: ${initialPassword}`;
+        if (logger.shouldLog('warn')) {
+            logger.warn(passwordMessage);
         } else {
-            logger.error('[Auth] Failed to read password file:', error.code || error.message);
-            logger.info('[Auth] Using default password: ' + DEFAULT_PASSWORD);
+            // 即使日志被禁用，也必须让管理员能够取得首次登录密码。
+            console.warn(passwordMessage);
         }
-        return DEFAULT_PASSWORD;
-    }
+        logger.warn('============================================================');
+        return storedPassword;
+    });
+}
+
+/**
+ * 读取密码文件内容；文件不存在或为空时安全地初始化随机密码。
+ */
+export async function readPasswordFile(pwdFilePath = path.join(process.cwd(), 'configs', 'pwd')) {
+    return initializeAdminPassword(pwdFilePath);
 }
 
 /**
  * 验证登录凭据
  */
-export async function validateCredentials(password) {
-    const storedPassword = await readPasswordFile();
+export async function validateCredentials(password, pwdFilePath) {
+    const storedPassword = await readPasswordFile(pwdFilePath);
     if (!storedPassword || !password) return false;
 
     // 新格式：pbkdf2:salt:hash
@@ -456,7 +478,7 @@ export async function handleLoginRequest(req, res) {
     return true;
 }
 
-// 定时清理过期token
-setInterval(cleanupExpiredTokens, 5 * 60 * 1000); // 每5分钟清理一次
+// 定时清理过期token；不阻止仅导入该模块的进程正常退出
+setInterval(cleanupExpiredTokens, 5 * 60 * 1000).unref(); // 每5分钟清理一次
 
 

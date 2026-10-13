@@ -12,6 +12,7 @@ coverage
 .env.local
 .env.*.local
 credentials.json
+configs/pwd
 *.md
 LICENSE
 jest.config.js

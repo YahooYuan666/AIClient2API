@@ -100,6 +100,11 @@ echo
 echo "服务器将在 http://localhost:3000 启动"
 echo "访问 http://localhost:3000 查看管理界面"
 echo "按 Ctrl+C 停止服务器"
+if [ ! -s "configs/pwd" ]; then
+    echo
+    echo "[重要] 检测到首次部署，启动后请在下方日志中保存随机生成的管理员密码："
+    echo "       [Auth] Initial admin password: ..."
+fi
 echo
 
 # 启动服务器

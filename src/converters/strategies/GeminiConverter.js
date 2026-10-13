@@ -165,8 +165,24 @@ export class GeminiConverter extends BaseConverter {
     constructor() {
         super('gemini');
         this.openAIResponsesStreamStates = new Map();
-        // Gemini -> OpenAI 流式转换的按请求状态（稳定的 chunk id、跨 chunk 递增的 tool_calls index）
+        // Gemini → OpenAI 流的按请求状态：稳定 chunk id、跨 chunk 的 tool_calls index。
+        // 单例转换器会服务并发请求，状态必须显式按 requestId 隔离和释放。
         this.openAIStreamStates = new Map();
+    }
+
+    /**
+     * 显式释放一次 Gemini → OpenAI 流的状态。
+     *
+     * 正常 STOP 会在转换器内自动清理；客户端中断、上游 throw 或无终止块 EOF 时，
+     * 由 common.js 的 finally 调用本方法，避免单例 Map 残留。
+     */
+    releaseOpenAIStreamState(requestId = null) {
+        this.openAIStreamStates.delete(requestId || 'default');
+    }
+
+    /** 供生命周期回归测试断言状态没有泄漏。 */
+    openAIStreamStateCount() {
+        return this.openAIStreamStates.size;
     }
 
     /**
@@ -384,11 +400,14 @@ export class GeminiConverter extends BaseConverter {
         const candidate = geminiChunk.candidates?.[0];
         if (!candidate) return null;
 
-        // [FIX] OpenAI 流式协议要求同一次响应内：chunk.id 恒定、tool_calls.index 跨 chunk 递增、
-        // finish_reason 只出现在结束块。Gemini 会把并行 functionCall 拆成多个 chunk 下发，
-        // 若每块都用 index:0 + 新 uuid + finish_reason:'tool_calls'，客户端会把所有调用
-        // 合并进同一个槽位，只剩一个空参数调用（表现为 inputSchema 校验失败）。
+        // Gemini 会把并行 functionCall 拆成多个 chunk。OpenAI 客户端却按同一
+        // chunk.id 与 tool_calls[].index 合并增量，因此状态必须跨 chunk、按请求保存。
+        // 兼容入口缺 requestId 时保留 default 槽，但只警告一次，不能假装它能隔离并发。
         const stateKey = requestId || 'default';
+        if (!requestId && !this.__warnedDefaultOpenAIStreamState) {
+            this.__warnedDefaultOpenAIStreamState = true;
+            console.warn('[GeminiConverter] toOpenAIStreamChunk missing requestId; concurrent streams share the default state');
+        }
         if (!this.openAIStreamStates.has(stateKey)) {
             this.openAIStreamStates.set(stateKey, {
                 chunkId: `chatcmpl-${uuidv4()}`,
@@ -461,7 +480,7 @@ export class GeminiConverter extends BaseConverter {
                 'MODEL_ARMOR': 'content_filter',
             };
             finishReason = finishReasonMap[candidate.finishReason] || 'stop';
-            // 结束块：本流出现过工具调用时，正常结束要上报 tool_calls（与 common.js 的修正逻辑一致）
+            // 工具调用数据块本身必须保持 finish_reason=null；只在原生终止块上报告 tool_calls。
             if (finishReason === 'stop' && streamState.sawToolCall) {
                 finishReason = 'tool_calls';
             }
@@ -492,9 +511,9 @@ export class GeminiConverter extends BaseConverter {
             }],
         };
 
-        // 结束块已下发，释放本请求的流状态
+        // 正常终止时转换器自行清理；其它退出路径由 common.js finally 显式清理。
         if (candidate.finishReason) {
-            this.openAIStreamStates.delete(stateKey);
+            this.releaseOpenAIStreamState(stateKey);
         }
 
         if(geminiChunk.usageMetadata){

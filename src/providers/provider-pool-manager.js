@@ -62,7 +62,8 @@ export class ProviderPoolManager {
         'openaiResponses-custom': 'gpt-5.5',
         'grok-web': 'grok-4.3',
         'grok-cli-oauth': 'grok-4.3',
-        'forward-api': 'gpt-5.5'
+        'forward-api': 'gpt-5.5',
+        'github-copilot': 'gpt-4.1'
     };
 
     constructor(providerPools, options = {}) {
@@ -1019,18 +1020,17 @@ export class ProviderPoolManager {
         this._isSelecting[providerType] = true;
         
         try {
-            // 在锁内部执行同步选择
-            return this._doSelectProvider(providerType, requestedModel, options);
+            return await this._doSelectProvider(providerType, requestedModel, options);
         } finally {
             this._isSelecting[providerType] = false;
         }
     }
 
     /**
-     * 实际执行 provider 选择的内部方法（同步执行，由锁保护）
+        * 实际执行 provider 选择的内部方法（异步执行，由锁保护）
      * @private
      */
-    _doSelectProvider(providerType, requestedModel, options) {
+    async _doSelectProvider(providerType, requestedModel, options) {
         const availableProviders = this.providerStatus[providerType] || [];
         
         // 检查并恢复已到恢复时间的提供商
@@ -1048,7 +1048,7 @@ export class ProviderPoolManager {
 
         // 如果指定了模型，则排除不支持该模型的提供商
         if (requestedModel) {
-            const modelFilteredProviders = availableAndHealthyProviders.filter(p => {
+            let modelFilteredProviders = availableAndHealthyProviders.filter(p => {
                 const supportedModels = getConfiguredSupportedModels(providerType, p.config);
                 if (supportedModels.length > 0) {
                     return supportedModels.includes(requestedModel);
@@ -1060,6 +1060,33 @@ export class ProviderPoolManager {
                 // 检查 notSupportedModels 数组中是否包含请求的模型，如果包含则排除
                 return !p.config.notSupportedModels.includes(requestedModel);
             });
+
+            if (providerType === MODEL_PROVIDER.ANTIGRAVITY) {
+                const { isAntigravityModelRetired } = await import('./gemini/antigravity-core.js');
+                if (isAntigravityModelRetired(requestedModel, now, 'free-tier')) {
+                    const tierEligibility = await Promise.all(modelFilteredProviders.map(async provider => {
+                        try {
+                            const tempConfig = {
+                                ...this.globalConfig,
+                                ...provider.config,
+                                MODEL_PROVIDER: providerType
+                            };
+                            delete tempConfig.providerPools;
+                            const serviceAdapter = getServiceAdapter(tempConfig);
+                            const antigravityService = serviceAdapter.antigravityApiService;
+                            if (antigravityService && !antigravityService.isInitialized) {
+                                await antigravityService.initialize();
+                            }
+                            const tierId = antigravityService?.tierId;
+                            return !isAntigravityModelRetired(requestedModel, now, tierId);
+                        } catch (err) {
+                            this._log('debug', `Failed to inspect Antigravity account tier for ${provider.uuid}: ${err.message}`);
+                            return true;
+                        }
+                    }));
+                    modelFilteredProviders = modelFilteredProviders.filter((_, index) => tierEligibility[index]);
+                }
+            }
 
             if (modelFilteredProviders.length === 0) {
                 this._log('warn', `No available providers for type: ${providerType} that support model: ${requestedModel}`);
@@ -1462,6 +1489,52 @@ export class ProviderPoolManager {
                         ...getProviderModels(providerType).filter(model => !customAliases.has(model)),
                         ...customModelIds
                     ]);
+
+                if (providerType === MODEL_PROVIDER.ANTIGRAVITY && this.providerStatus[providerType].length > 0) {
+                    const { isAntigravityModelRetired } = await import('./gemini/antigravity-core.js');
+                    const currentTime = Date.now();
+                    if (models.some(model => isAntigravityModelRetired(model, currentTime, 'free-tier'))) {
+                        const accountAvailability = [];
+                        for (const providerStatus of this.providerStatus[providerType]) {
+                            let tierId;
+                            let accountModelIds = null;
+                            try {
+                                const tempConfig = {
+                                    ...this.globalConfig,
+                                    ...providerStatus.config,
+                                    MODEL_PROVIDER: providerType
+                                };
+                                delete tempConfig.providerPools;
+                                const serviceAdapter = getServiceAdapter(tempConfig);
+                                if (typeof serviceAdapter.listModels === 'function') {
+                                    try {
+                                        const nativeModelList = await serviceAdapter.listModels();
+                                        if (Array.isArray(nativeModelList?.models)) {
+                                            accountModelIds = new Set(nativeModelList.models
+                                                .map(model => model.name?.replace(/^models\//, ''))
+                                                .filter(Boolean));
+                                        }
+                                    } catch (err) {
+                                        this._log('debug', `Failed to load Antigravity account tier for ${providerStatus.uuid}: ${err.message}`);
+                                    }
+                                }
+                                tierId = serviceAdapter.antigravityApiService?.tierId;
+                            } catch (err) {
+                                this._log('debug', `Failed to inspect Antigravity account tier for ${providerStatus.uuid}: ${err.message}`);
+                            }
+                            accountAvailability.push({ tierId, modelIds: accountModelIds });
+                        }
+
+                        models = models.filter(model => {
+                            if (!isAntigravityModelRetired(model, currentTime, 'free-tier')) return true;
+                            return accountAvailability.some(({ tierId, modelIds }) => {
+                                if (!tierId) return true;
+                                if (isAntigravityModelRetired(model, currentTime, tierId)) return false;
+                                return !modelIds || modelIds.has(model);
+                            });
+                        });
+                    }
+                }
 
                 // 如果硬编码的模型列表为空，或者该类型的提供商在号池中没有配置节点，尝试从服务获取
                 // 只有在非号池模式，或者号池中有节点时才尝试获取，避免无节点时读取全局默认配置

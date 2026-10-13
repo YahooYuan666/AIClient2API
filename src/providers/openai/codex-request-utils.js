@@ -1,3 +1,54 @@
+import crypto from 'crypto';
+
+function asNonEmptyString(value) {
+    if (typeof value === 'string' && value.trim()) {
+        return value;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return String(value);
+    }
+    return null;
+}
+
+function hashCacheSeed(value) {
+    const serialized = JSON.stringify(value) ?? '';
+    return crypto.createHash('sha256').update(serialized).digest('hex');
+}
+
+/**
+ * Resolve one stable cache identity for the Codex request body and session headers.
+ *
+ * A client-supplied prompt_cache_key is authoritative. Replacing it with a proxy-local
+ * UUID breaks cache locality for long-running sessions and after proxy restarts. When a
+ * client does not supply one, prefer its session metadata; the deterministic prefix
+ * fingerprint is only a last-resort fallback for append-only clients.
+ */
+export function resolveCodexCacheIdentity(requestBody, metadata = {}) {
+    const explicitKey = asNonEmptyString(requestBody?.prompt_cache_key);
+    if (explicitKey) {
+        return {key: explicitKey, source: 'prompt_cache_key'};
+    }
+
+    const metadataFields = ['session_id', 'conversation_id', 'thread_id', 'user_id'];
+    for (const field of metadataFields) {
+        const value = asNonEmptyString(metadata?.[field]);
+        if (value) {
+            return {key: value, source: `metadata.${field}`};
+        }
+    }
+
+    // The first input item remains unchanged in normal append-only conversations. Including
+    // instructions and tools prevents unrelated prompts from sharing one global "default" key
+    // while keeping the result stable across processes and model switches.
+    const prefixSeed = {
+        instructions: requestBody?.instructions || '',
+        tools: Array.isArray(requestBody?.tools) ? requestBody.tools : [],
+        input: Array.isArray(requestBody?.input) ? requestBody.input.slice(0, 1) : requestBody?.input || ''
+    };
+    const fingerprint = hashCacheSeed(prefixSeed).slice(0, 32);
+    return {key: `aic2a-${fingerprint}`, source: 'prefix_fingerprint'};
+}
+
 export function normalizeCodexInstructions(requestBody) {
     if (!Array.isArray(requestBody.input)) {
         return requestBody;

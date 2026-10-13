@@ -50,12 +50,11 @@ const lockManager = new FileLockManager();
  * 超时包装函数
  */
 function withTimeout(promise, ms = 30000) {
-    return Promise.race([
-        promise,
-        new Promise((_, reject) =>
-            setTimeout(() => reject(new Error(`Operation timeout after ${ms}ms`)), ms)
-        )
-    ]);
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(`Operation timeout after ${ms}ms`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 }
 
 /**

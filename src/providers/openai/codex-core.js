@@ -11,7 +11,7 @@ import {configureTLSSidecar, isTLSSidecarEnabledForProvider} from '../../utils/p
 import {MODEL_PROVIDER, formatExpiryLog, normalizeProviderErrorMessage} from '../../utils/common.js';
 import {getProxyConfigForProvider} from '../../utils/proxy-utils.js';
 import {getProviderModels} from '../provider-models.js';
-import {normalizeCodexInstructions} from './codex-request-utils.js';
+import {normalizeCodexInstructions, resolveCodexCacheIdentity} from './codex-request-utils.js';
 
 const baseModels = getProviderModels(MODEL_PROVIDER.CODEX_API);
 const fastModels = baseModels.map(m => `${m}-fast`);
@@ -130,10 +130,6 @@ export class CodexApiService {
         this.accessTokenOnlyRefreshLogged = false;
         this.uuid = config.uuid; // 保存 uuid 用于号池管理
         this.isInitialized = false;
-
-        // 会话缓存管理
-        this.conversationCache = new Map(); // key: model-userId, value: {id, expire}
-        this.startCacheCleanup();
 
         this.imageGenTool = {type: 'image_generation', output_format: 'png'};
     }
@@ -439,10 +435,14 @@ export class CodexApiService {
             'Connection': 'Keep-Alive'
         };
 
-        // 设置 Conversation_id 和 Session_id
+        // Codex 当前使用连字符形式的 session/thread 头维持缓存亲和性。
+        // 同时保留旧下划线形式，兼容较老的 ChatGPT Codex 网关。
         if (cacheId) {
-            headers['Conversation_id'] = cacheId;
-            headers['Session_id'] = cacheId;
+            const headerCacheId = this.toSafeCacheHeaderValue(cacheId);
+            headers['session-id'] = headerCacheId;
+            headers['thread-id'] = headerCacheId;
+            headers['Conversation_id'] = headerCacheId;
+            headers['Session_id'] = headerCacheId;
         }
 
         // 根据是否流式设置 Accept 头
@@ -476,11 +476,9 @@ export class CodexApiService {
      * 准备请求体
      */
     async prepareRequestBody(model, requestBody, stream) {
-        // 提取 metadata 并从请求体中移除，避免透传到上游
+        // 提取 metadata 并从请求体中移除，避免透传到上游。
+        // prompt_cache_key 是 Responses API 的正式顶层字段，必须保留。
         const metadata = requestBody.metadata || {};
-
-        // 明确会话维度：优先使用 session_id 或 conversation_id，其次 user_id
-        const sessionId = metadata.session_id || metadata.conversation_id || metadata.user_id || 'default';
 
         // 判断是否为 fast 模型并确定默认值
         const normalizedModel = String(model || '').trim();
@@ -543,23 +541,11 @@ export class CodexApiService {
             logger.info(`[Codex] Detected -fast model: ${normalizedModel} -> ${upstreamModel}, service_tier: ${cleanedBody.service_tier || defaultServiceTier}`);
         }
 
-        // 生成会话缓存键
-        // 弱化 model 依赖，以提升同会话跨模型的缓存命中率
-        // 仅当 sessionId 为 'default' 时加上 model 前缀，提供基础隔离
-        let cacheKey = sessionId;
-        if (sessionId === 'default') {
-            cacheKey = `${model}-default`;
-        }
-
-        let cache = this.conversationCache.get(cacheKey);
-
-        if (!cache || cache.expire < Date.now()) {
-            cache = {
-                id: crypto.randomUUID(),
-                expire: Date.now() + 3600000 // 1 小时
-            };
-            this.conversationCache.set(cacheKey, cache);
-        }
+        // Preserve the client's cache lineage. The previous implementation always replaced
+        // prompt_cache_key with a random UUID that expired after one hour, even when the client
+        // supplied a stable key. That made long/image-bearing conversations repeatedly lose
+        // upstream cache affinity.
+        const cacheIdentity = resolveCodexCacheIdentity(cleanedBody, metadata);
 
         // 注意：requestBody 已经去除了 metadata
         const result = {
@@ -574,7 +560,7 @@ export class CodexApiService {
                 summary: cleanedBody.reasoning?.summary || 'auto',
             },
             stream,
-            prompt_cache_key: cache.id
+            prompt_cache_key: cacheIdentity.key
         };
 
         delete result.messages;
@@ -1023,29 +1009,14 @@ export class CodexApiService {
         };
     }
 
-    /**
-     * 启动缓存清理
-     */
-    startCacheCleanup() {
-        // 每 15 分钟清理过期缓存
-        this.cleanupInterval = setInterval(() => {
-            const now = Date.now();
-            for (const [key, cache] of this.conversationCache.entries()) {
-                if (cache.expire < now) {
-                    this.conversationCache.delete(key);
-                }
-            }
-        }, 15 * 60 * 1000);
-    }
-
-    /**
-     * 停止缓存清理
-     */
-    stopCacheCleanup() {
-        if (this.cleanupInterval) {
-            clearInterval(this.cleanupInterval);
-            this.cleanupInterval = null;
+    toSafeCacheHeaderValue(cacheKey) {
+        const value = String(cacheKey);
+        // Node rejects non-Latin-1/control characters in header values. Keep ordinary client
+        // UUIDs/keys unchanged; hash unusual values while retaining stable affinity.
+        if (/^[\x21-\x7E]{1,256}$/.test(value)) {
+            return value;
         }
+        return `aic2a-${crypto.createHash('sha256').update(value).digest('hex').slice(0, 32)}`;
     }
 
     /**
