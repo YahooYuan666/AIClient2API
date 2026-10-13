@@ -72,12 +72,30 @@ describe('optional greedy sticky pool selection', () => {
 
     test('greedy sticky keeps one conversation on the greediest account', async () => {
         const manager = pool('greedy-sticky');
-        const first = await manager.acquireSlot('openai-custom', null, { sessionId: 'conversation' });
-        const second = await manager.acquireSlot('openai-custom', null, { sessionId: 'conversation' });
-        expect(first.uuid).toBe('high');
-        expect(second.uuid).toBe('high');
-        manager.releaseSlot('openai-custom', first.uuid);
-        manager.releaseSlot('openai-custom', second.uuid);
+        const first = await manager.selectProviderWithFallback('openai-custom', null, { sessionId: 'conversation' });
+        const second = await manager.selectProviderWithFallback('openai-custom', null, { sessionId: 'conversation' });
+        expect(first.config.uuid).toBe('high');
+        expect(second.config.uuid).toBe('high');
+        manager.releaseSlot('openai-custom', first.config.uuid);
+        manager.releaseSlot('openai-custom', second.config.uuid);
+    });
+
+    test('a later higher-ranked account does not steal a bound conversation', async () => {
+        const manager = pool('greedy-sticky');
+        await manager.selectProviderWithFallback('openai-custom', null, { sessionId: 'conversation' });
+        manager.providerStatus['openai-custom'][0].config.quotaWindows.weekly.remainingFraction = 0.1;
+        manager.providerStatus['openai-custom'][1].config.quotaWindows.weekly.remainingFraction = 0.9;
+        const next = await manager.selectProviderWithFallback('openai-custom', null, { sessionId: 'conversation' });
+        expect(next.config.uuid).toBe('high');
+    });
+
+    test('selecting an account does not query Google for quota', async () => {
+        const quota = jest.fn(async () => ({}));
+        getServiceAdapter.mockImplementation(() => ({ antigravityApiService: { getQuotaSummary: quota } }));
+        const manager = pool('greedy-sticky');
+        await manager.selectProviderWithFallback('openai-custom', null, { sessionId: 'conversation' });
+        expect(quota).not.toHaveBeenCalled();
+        getServiceAdapter.mockReset();
     });
 
     test('a full account sends a different conversation to the next account', async () => {
@@ -113,6 +131,14 @@ describe('optional greedy sticky pool selection', () => {
         expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('[Quota Refresh] startup'));
         expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('weekly 90%'));
         expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('5h 50%'));
+    });
+
+    test('marking the bound account unhealthy lets the next request move', async () => {
+        const manager = pool('greedy-sticky');
+        await manager.selectProviderWithFallback('openai-custom', null, { sessionId: 'conversation' });
+        manager.markProviderUnhealthyImmediately('openai-custom', { uuid: 'high' }, 'token refresh failed');
+        const next = await manager.selectProviderWithFallback('openai-custom', null, { sessionId: 'conversation' });
+        expect(next.config.uuid).toBe('low');
     });
 
     test('an exhausted account is skipped and the next account serves the retry', async () => {

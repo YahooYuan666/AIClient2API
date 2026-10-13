@@ -1184,7 +1184,6 @@ export class ProviderPoolManager {
 
     async _acquireGreedyStickySlot(providerType, requestedModel, options) {
         this.accountScheduler.noteUserRequest();
-        this._scheduleQuotaRefresh(providerType, { reason: 'background' });
         const accounts = this._greedyAccountView(providerType, requestedModel, options);
         const decision = await this.accountScheduler.acquire({
             uuid: options.stickyUuid,
@@ -1220,6 +1219,29 @@ export class ProviderPoolManager {
                 this._scheduleQuotaRefresh(providerType, { startup: true, reason: 'startup' });
             }
         }
+        this._startQuotaRefreshLoop();
+    }
+
+    _startQuotaRefreshLoop() {
+        if (this._quotaRefreshLoop) return;
+        const tick = () => {
+            this._quotaRefreshLoop = setTimeout(() => {
+                this._quotaRefreshLoop = null;
+                this._refreshActiveQuota().catch(error => {
+                    this._log('warn', `[Quota Refresh] interval failed: ${error.message}`);
+                }).finally(tick);
+            }, 60 * 1000);
+            this._quotaRefreshLoop.unref?.();
+        };
+        tick();
+    }
+
+    async _refreshActiveQuota() {
+        for (const providerType of Object.keys(this.providerStatus)) {
+            if (this._usesGreedySticky(providerType)) {
+                await this._refreshDueQuota(providerType, { reason: 'interval' });
+            }
+        }
     }
 
     _scheduleQuotaRefresh(providerType, { startup = false, reason = 'interval' } = {}) {
@@ -1246,8 +1268,6 @@ export class ProviderPoolManager {
             const displayName = this._getDisplayName(provider.config);
             if (!uuid || !this.accountScheduler.shouldRefresh(uuid, { startup }) || this.refreshingUuids.has(uuid)) continue;
             this.accountScheduler.markRefreshed(uuid);
-            this.refreshingUuids.add(uuid);
-            this.accountScheduler.setRefreshing(uuid, true);
             try {
                 const tempConfig = { ...this.globalConfig, ...provider.config, MODEL_PROVIDER: providerType };
                 delete tempConfig.providerPools;
@@ -1267,10 +1287,6 @@ export class ProviderPoolManager {
                 this._log('info', `[Quota Refresh] ${reason} ${displayName}: ${this._formatQuotaWindows(windows)}`);
             } catch (error) {
                 this._log('warn', `[Quota Refresh] ${reason} failed for ${displayName}: ${error.message}`);
-            } finally {
-                this.refreshingUuids.delete(uuid);
-                this.accountScheduler.setRefreshing(uuid, false);
-                this.accountScheduler.notify(uuid);
             }
         }
     }
@@ -1863,6 +1879,7 @@ export class ProviderPoolManager {
 
             if (this.maxErrorCount > 0 && provider.config.errorCount >= this.maxErrorCount) {
                 provider.config.isHealthy = false;
+                this.accountScheduler?.markUnhealthy(providerConfig.uuid);
                 
                 // 健康状态变化日志
                 if (wasHealthy) {
@@ -1893,6 +1910,7 @@ export class ProviderPoolManager {
         if (provider) {
             const wasHealthy = provider.config.isHealthy;
             provider.config.isHealthy = false;
+            this.accountScheduler?.markUnhealthy(providerConfig.uuid);
             provider.config.needsRefresh = false; // 报错时不健康，清除刷新标记，防止卡死
             provider.config.refreshCount = 0;
             provider.config.errorCount = this.maxErrorCount; // Set to max to indicate definitive failure
@@ -1931,6 +1949,7 @@ export class ProviderPoolManager {
         const provider = this._findProvider(providerType, providerConfig.uuid);
         if (provider) {
             provider.config.isHealthy = false;
+            this.accountScheduler?.markUnhealthy(providerConfig.uuid);
             provider.config.needsRefresh = false; // 报错时不健康，清除刷新标记，防止卡死
             provider.config.refreshCount = 0;
             provider.config.errorCount = this.maxErrorCount; // Set to max to indicate definitive failure
@@ -1971,6 +1990,7 @@ export class ProviderPoolManager {
         if (provider) {
             const wasHealthy = provider.config.isHealthy;
             provider.config.isHealthy = true;
+            this.accountScheduler?.markHealthy(providerConfig.uuid);
             provider.config.errorCount = 0;
             provider.config.refreshCount = 0;
             provider.config.needsRefresh = false;
@@ -2036,6 +2056,7 @@ export class ProviderPoolManager {
             // 不走 markProviderHealthy：那条路径会把 usageCount 加一，刷新并不是一次真实请求。
             const wasHealthy = provider.config.isHealthy;
             provider.config.isHealthy = true;
+            this.accountScheduler?.markHealthy(uuid);
             provider.config.errorCount = 0;
             provider.config.lastErrorTime = null;
             provider.config.lastErrorMessage = null;
@@ -2064,6 +2085,7 @@ export class ProviderPoolManager {
             provider.config.errorCount = 0;
             provider.config.usageCount = 0;
             provider.config.isHealthy = true;
+            this.accountScheduler?.markHealthy(providerConfig.uuid);
             provider.config.lastErrorTime = null;
             provider.config.lastErrorMessage = null;
             provider.config._lastSelectionSeq = 0;
@@ -2083,6 +2105,7 @@ export class ProviderPoolManager {
 
         pool.forEach(provider => {
             provider.config.isHealthy = true;
+            this.accountScheduler?.markHealthy(provider.config.uuid);
             provider.config.errorCount = 0;
             provider.config.lastErrorTime = null;
             provider.config.lastErrorMessage = null;

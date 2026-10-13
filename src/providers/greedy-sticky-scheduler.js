@@ -134,21 +134,34 @@ export class GreedyStickyScheduler {
     async acquire({ uuid, sessionId, accounts }) {
         for (const account of accounts || []) this.updateAccount(account.uuid, account);
         const started = this.now();
+        let sticky = uuid || (sessionId ? this.sessions.get(sessionId) : null) || null;
         while (this.now() - started <= this.queueTimeoutMs) {
-            if (uuid && this.refreshing.has(uuid)) {
-                const refreshed = await this.waitForChange(uuid, this.refreshWaitMs);
-                if (!refreshed || this.refreshing.has(uuid)) return { status: 'switch' };
+            if (sticky && this.blocked(sticky)) {
+                if (sessionId && this.sessions.get(sessionId) === sticky) this.sessions.delete(sessionId);
+                sticky = null;
+            }
+            if (sticky && this.refreshing.has(sticky)) {
+                const waitingFor = sticky;
+                const refreshed = await this.waitForChange(waitingFor, this.refreshWaitMs);
+                if (!refreshed || this.refreshing.has(waitingFor)) {
+                    if (sessionId && this.sessions.get(sessionId) === waitingFor) this.sessions.delete(sessionId);
+                    sticky = null;
+                }
                 continue;
             }
-            const active = this.inFlight.get(uuid) || 0;
-            if (uuid && !this.blocked(uuid) && active < this.limit) {
-                this.inFlight.set(uuid, active + 1);
-                return { status: 'acquired', uuid };
+            const active = this.inFlight.get(sticky) || 0;
+            if (sticky && active < this.limit) {
+                this.inFlight.set(sticky, active + 1);
+                return { status: 'acquired', uuid: sticky };
             }
-            if (uuid && !this.blocked(uuid) && sessionId && this.sessions.get(sessionId) === uuid) {
-                const granted = await this.enqueue(uuid);
-                if (granted) return { status: 'acquired', uuid };
-                if (this.blocked(uuid)) return { status: 'switch' };
+            if (sticky && sessionId && this.sessions.get(sessionId) === sticky) {
+                const granted = await this.enqueue(sticky);
+                if (granted) return { status: 'acquired', uuid: sticky };
+                if (this.blocked(sticky)) {
+                    this.sessions.delete(sessionId);
+                    sticky = null;
+                    continue;
+                }
                 return { status: 'busy' };
             }
             const candidate = this.rankAvailable(accounts)[0];
@@ -208,7 +221,7 @@ export class GreedyStickyScheduler {
     }
 
     blocked(uuid) {
-        if (this.unhealthy.has(uuid)) return true;
+        if (this.unhealthy.has(uuid) || this.refreshing.has(uuid)) return true;
         const account = this.accounts.get(uuid);
         if (!account) return true;
         return accountQuotaState(account, this.now()) !== 'known';

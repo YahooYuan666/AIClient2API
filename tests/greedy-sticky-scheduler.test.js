@@ -54,6 +54,13 @@ describe('greedy sticky assignment', () => {
         return new GreedyStickyScheduler({ now: () => now, queueTimeoutMs: 20 });
     }
 
+    test('a bound conversation stays put when another account later ranks higher', async () => {
+        const gate = scheduler();
+        await gate.acquire({ accounts: [account('old', 0.9, 20), account('new', 0.2, 100)], sessionId: 'conversation' });
+        const next = await gate.acquire({ accounts: [account('old', 0.2, 100), account('new', 0.9, 20)], sessionId: 'conversation' });
+        expect(next.uuid).toBe('old');
+    });
+
     test('a new conversation uses the highest greed account and then sticks to it', async () => {
         const gate = scheduler();
         const accounts = [account('low', 0.2, 100), account('high', 0.9, 20)];
@@ -117,10 +124,11 @@ describe('greedy sticky assignment', () => {
         await expect(gate.acquire({ uuid: 'old', accounts, sessionId: 'conversation' })).resolves.toMatchObject({ uuid: 'new', switched: true });
     });
 
-    test('token refresh waits briefly and then allows a switch', async () => {
+    test('token refresh waits briefly and then leaves the stuck account', async () => {
         const gate = new GreedyStickyScheduler({ now: () => now, queueTimeoutMs: 20, refreshWaitMs: 20 });
         gate.setRefreshing('old', true);
-        await expect(gate.acquire({ uuid: 'old', accounts: [account('old', 1, 10)], sessionId: 'conversation' })).resolves.toMatchObject({ status: 'switch' });
+        await expect(gate.acquire({ uuid: 'old', accounts: [account('old', 1, 10), account('fresh', 0.4, 10)], sessionId: 'conversation' })).resolves.toMatchObject({ uuid: 'fresh' });
+        expect(gate.sessions.get('conversation')).toBe('fresh');
     });
 
     test('missing session identity follows the current ranking without pretending to stick', async () => {
