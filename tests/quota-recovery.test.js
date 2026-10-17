@@ -28,7 +28,7 @@ function response() {
 }
 
 function poolWith(accounts, currentUuid) {
-    return {
+    const manager = {
         markProviderHealthy: jest.fn(),
         markProviderUnhealthy: jest.fn(),
         markProviderUnhealthyWithRecoveryTime: jest.fn(),
@@ -41,6 +41,27 @@ function poolWith(accounts, currentUuid) {
         },
         currentUuid
     };
+    manager.selectProviderWithFallback = async (providerType, requestedModel, options = {}) => {
+        const excluded = new Set(options.excludeUuids || []);
+        const chain = [providerType, ...(manager.fallbackChain?.[providerType] || [])];
+        for (const type of chain) {
+            const selected = (manager.providerStatus[type] || []).find(provider => {
+                const config = provider.config;
+                return config?.uuid && !excluded.has(config.uuid) && config.isHealthy !== false && config.isDisabled !== true;
+            });
+            if (selected) return { config: selected.config, actualProviderType: type, isFallback: type !== providerType };
+        }
+        const mapping = manager.modelFallbackMapping?.[requestedModel];
+        if (!mapping) return null;
+        const mapped = (manager.providerStatus[mapping.targetProviderType] || []).find(provider => {
+            const config = provider.config;
+            return config?.uuid && !excluded.has(config.uuid) && config.isHealthy !== false && config.isDisabled !== true;
+        });
+        return mapped
+            ? { config: mapped.config, actualProviderType: mapping.targetProviderType, actualModel: mapping.targetModel, isFallback: true }
+            : null;
+    };
+    return manager;
 }
 
 function quotaError({ body, asString = false, recovery, exhausted = true } = {}) {
@@ -89,6 +110,21 @@ describe('Google quota metadata parsing', () => {
         }), now);
         expect(recovery.toISOString()).toBe('2026-10-09T18:00:00.000Z');
         expect(isQuotaExhaustedError(quotaError({ body: exhaustedBody() }))).toBe(true);
+    });
+
+    test('an absolute reset time wins even when an earlier detail only has a short delay', () => {
+        const recovery = getQuotaRecoveryTime(quotaError({
+            body: [{
+                error: {
+                    status: 'RESOURCE_EXHAUSTED',
+                    details: [
+                        { retryDelay: '5s' },
+                        { metadata: { quotaResetTimeStamp: '2026-10-09T18:00:00.000Z' } }
+                    ]
+                }
+            }]
+        }), now);
+        expect(recovery.toISOString()).toBe('2026-10-09T18:00:00.000Z');
     });
 
     test('reads hours, minutes and seconds from a raw string body', () => {
@@ -168,6 +204,78 @@ describe('quota exhaustion does not spin on the same account', () => {
         expect(elapsed).toBeLessThan(1500);
         expect(mockGetApiServiceWithFallback).toHaveBeenCalledTimes(1);
         expect(second.generateContentStream).toHaveBeenCalledTimes(1);
+    });
+
+    test('a model mapping can take over when the current pool is exhausted', async () => {
+        const manager = poolWith([{ uuid: 'only' }], 'only');
+        manager.modelFallbackMapping = {
+            'gemini-3.8-flash-high': { targetProviderType: 'gemini-cli-oauth', targetModel: 'gemini-3.8-flash' }
+        };
+        manager.providerStatus['gemini-cli-oauth'] = [{
+            uuid: 'backup',
+            config: { uuid: 'backup', isHealthy: true }
+        }];
+        const backup = failingService(Object.assign(new Error('mapped backup answered'), { status: 400, response: { status: 400, data: {} } }));
+        mockGetApiServiceWithFallback.mockResolvedValueOnce({
+            service: backup,
+            uuid: 'backup',
+            actualProviderType: 'gemini-cli-oauth',
+            actualModel: 'gemini-3.8-flash',
+            serviceConfig: {}
+        });
+        await runStream(quotaError({ body: exhaustedBody() }), manager);
+        expect(mockGetApiServiceWithFallback).toHaveBeenCalledTimes(1);
+        expect(mockGetApiServiceWithFallback.mock.calls[0][2].excludeUuids).toEqual(['only']);
+        expect(backup.generateContentStream).toHaveBeenCalledTimes(1);
+    });
+
+    test('a unary model mapping can take over when the current pool is exhausted', async () => {
+        const manager = poolWith([{ uuid: 'only' }], 'only');
+        manager.modelFallbackMapping = {
+            'gemini-3.8-flash-high': { targetProviderType: 'gemini-cli-oauth', targetModel: 'gemini-3.8-flash' }
+        };
+        manager.providerStatus['gemini-cli-oauth'] = [{
+            uuid: 'backup',
+            config: { uuid: 'backup', isHealthy: true }
+        }];
+        const backup = failingService(Object.assign(new Error('mapped backup answered'), { status: 400, response: { status: 400, data: {} } }));
+        mockGetApiServiceWithFallback.mockResolvedValueOnce({
+            service: backup,
+            uuid: 'backup',
+            actualProviderType: 'gemini-cli-oauth',
+            actualModel: 'gemini-3.8-flash',
+            serviceConfig: {}
+        });
+        const res = response();
+        await handleUnaryRequest(
+            res, failingService(quotaError({ body: exhaustedBody() })),
+            'gemini-3.8-flash-high', {}, 'openai', 'gemini-antigravity',
+            'none', null, manager, 'only', null, { CONFIG: {}, maxRetries: 5 }
+        );
+        expect(mockGetApiServiceWithFallback).toHaveBeenCalledTimes(1);
+        expect(backup.generateContent).toHaveBeenCalledTimes(1);
+    });
+
+    test('a second exhausted account stays excluded together with the first', async () => {
+        const manager = poolWith([{ uuid: 'first' }, { uuid: 'second' }, { uuid: 'third' }], 'first');
+        const secondError = quotaError({ body: exhaustedBody() });
+        const second = failingService(secondError);
+        const third = failingService(Object.assign(new Error('stop'), { status: 400, response: { status: 400, data: {} } }));
+        mockGetApiServiceWithFallback
+            .mockResolvedValueOnce({
+                service: second, uuid: 'second', actualProviderType: 'gemini-antigravity',
+                actualModel: 'gemini-3.8-flash-high', serviceConfig: {}
+            })
+            .mockResolvedValueOnce({
+                service: third, uuid: 'third', actualProviderType: 'gemini-antigravity',
+                actualModel: 'gemini-3.8-flash-high', serviceConfig: {}
+            });
+
+        await runStream(quotaError({ body: exhaustedBody() }), manager);
+
+        expect(mockGetApiServiceWithFallback).toHaveBeenCalledTimes(2);
+        expect(mockGetApiServiceWithFallback.mock.calls[0][2].excludeUuids).toEqual(['first']);
+        expect(mockGetApiServiceWithFallback.mock.calls[1][2].excludeUuids).toEqual(['first', 'second']);
     });
 
     test('a plain 429 without quota metadata still uses the short cooldown path', async () => {

@@ -10,20 +10,16 @@ export function isQuotaExhaustedError(error) {
 }
 
 export function getQuotaRecoveryTime(error, now = Date.now()) {
-    const entries = getErrorEntries(error);
-    for (const entry of entries) {
-        const details = entry?.error?.details;
-        if (!Array.isArray(details)) continue;
-        for (const detail of details) {
-            const timestamp = detail?.metadata?.quotaResetTimeStamp;
-            if (timestamp) {
-                const ms = Date.parse(timestamp);
-                if (!Number.isNaN(ms) && ms > now) return new Date(ms);
-            }
-            const delay = detail?.metadata?.quotaResetDelay || detail?.retryDelay;
-            const milliseconds = parseGoogleDuration(delay);
-            if (milliseconds > 0) return new Date(now + milliseconds);
-        }
+    const details = getErrorEntries(error).flatMap(entry => Array.isArray(entry?.error?.details) ? entry.error.details : []);
+    for (const detail of details) {
+        const timestamp = detail?.metadata?.quotaResetTimeStamp;
+        const ms = Date.parse(timestamp || '');
+        if (!Number.isNaN(ms) && ms > now) return new Date(ms);
+    }
+    for (const detail of details) {
+        const delay = detail?.metadata?.quotaResetDelay || detail?.retryDelay;
+        const milliseconds = parseGoogleDuration(delay);
+        if (milliseconds > 0) return new Date(now + milliseconds);
     }
     return null;
 }

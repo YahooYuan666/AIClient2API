@@ -136,6 +136,38 @@ describe('upstream stream completion and truncation', () => {
         expect(manager.markProviderHealthy).not.toHaveBeenCalled();
     });
 
+    test('a malformed finish and later response failures share one budget of three upstream calls', async () => {
+        const malformed = {
+            candidates: [{
+                finishReason: 'MALFORMED_FUNCTION_CALL',
+                finishMessage: 'Function call is empty - no input to parse.',
+                content: { role: 'model', parts: [{ text: '' }] }
+            }]
+        };
+        let calls = 0;
+        const service = {
+            calls: () => calls,
+            generateContentStream: jest.fn(() => {
+                calls += 1;
+                return (async function* () { yield malformed; })();
+            })
+        };
+        mockGetApiServiceWithFallback.mockImplementation(async () => ({
+            service,
+            uuid: 'only',
+            actualProviderType: 'gemini-antigravity',
+            actualModel: 'gemini-3.8-flash-high',
+            serviceConfig: {}
+        }));
+        const res = response();
+        await handleStreamRequest(
+            res, service, 'gemini-3.8-flash-high', {}, 'claude', 'gemini-antigravity',
+            'none', null, pool(), 'only', null,
+            { CONFIG: { EMPTY_RESPONSE_MAX_RETRIES: 2, EMPTY_RESPONSE_RETRY_DELAY_MS: 1 }, maxRetries: 0 }
+        );
+        expect(service.calls()).toBe(3);
+    });
+
     test('three truncated attempts end as an error instead of a synthetic success', async () => {
         const textOnly = { candidates: [{ content: { role: 'model', parts: [{ text: 'partial' }] } }] };
         const service = serviceWith([[], [], [textOnly]]);

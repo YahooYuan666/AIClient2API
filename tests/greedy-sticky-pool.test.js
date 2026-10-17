@@ -50,13 +50,16 @@ afterEach(() => {
 });
 
 function node(uuid, remaining, minutes) {
+    const window = fraction => ({ remainingFraction: fraction, resetAt: later(minutes) });
     return {
         uuid,
         isHealthy: true,
         isDisabled: false,
         quotaWindows: {
-            weekly: { remainingFraction: remaining, resetAt: later(minutes) },
-            fiveHour: { remainingFraction: 1, resetAt: later(60) }
+            gemini: { weekly: window(remaining), fiveHour: window(1) },
+            thirdParty: { weekly: window(remaining), fiveHour: window(1) },
+            weekly: window(remaining),
+            fiveHour: window(1)
         },
         quotaWindowsUpdatedAt: now
     };
@@ -87,6 +90,27 @@ describe('optional greedy sticky pool selection', () => {
         manager.providerStatus['openai-custom'][1].config.quotaWindows.weekly.remainingFraction = 0.9;
         const next = await manager.selectProviderWithFallback('openai-custom', null, { sessionId: 'conversation' });
         expect(next.config.uuid).toBe('high');
+    });
+
+    test('a conversation that switches from Gemini to Claude re-picks by the 3p buckets', async () => {
+        const manager = pool('greedy-sticky');
+        // high 号 Gemini 桶最肥但 3p 桶见底；low 号反之。
+        manager.providerStatus['openai-custom'][0].config.quotaWindows = {
+            gemini: { weekly: { remainingFraction: 0.9, resetAt: later(20) }, fiveHour: { remainingFraction: 1, resetAt: later(60) } },
+            thirdParty: { weekly: { remainingFraction: 0, resetAt: later(20) }, fiveHour: { remainingFraction: 1, resetAt: later(60) } },
+            weekly: { remainingFraction: 0.9, resetAt: later(20) },
+            fiveHour: { remainingFraction: 1, resetAt: later(60) }
+        };
+        manager.providerStatus['openai-custom'][1].config.quotaWindows = {
+            gemini: { weekly: { remainingFraction: 0.2, resetAt: later(100) }, fiveHour: { remainingFraction: 1, resetAt: later(60) } },
+            thirdParty: { weekly: { remainingFraction: 0.8, resetAt: later(100) }, fiveHour: { remainingFraction: 1, resetAt: later(60) } },
+            weekly: { remainingFraction: 0.2, resetAt: later(100) },
+            fiveHour: { remainingFraction: 1, resetAt: later(60) }
+        };
+        const onGemini = await manager.selectProviderWithFallback('openai-custom', 'gemini-3.8-flash-high', { sessionId: 'conversation' });
+        expect(onGemini.config.uuid).toBe('high');
+        const onClaude = await manager.selectProviderWithFallback('openai-custom', 'gemini-claude-sonnet-4-6', { sessionId: 'conversation' });
+        expect(onClaude.config.uuid).toBe('low');
     });
 
     test('selecting an account does not query Google for quota', async () => {
@@ -126,8 +150,8 @@ describe('optional greedy sticky pool selection', () => {
         manager.refreshQuotaOnStartup();
         await new Promise(resolve => setTimeout(resolve, 20));
 
-        expect(manager.providerStatus['openai-custom'][0].config.quotaWindows.weekly.remainingFraction).toBeCloseTo(0.9);
-        expect(manager.providerStatus['openai-custom'][1].config.quotaWindows.weekly.remainingFraction).toBeCloseTo(0.2);
+        expect(manager.providerStatus['openai-custom'][0].config.quotaWindows.gemini.weekly.remainingFraction).toBeCloseTo(0.9);
+        expect(manager.providerStatus['openai-custom'][1].config.quotaWindows.gemini.weekly.remainingFraction).toBeCloseTo(0.2);
         expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('[Quota Refresh] startup'));
         expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('weekly 90%'));
         expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('5h 50%'));

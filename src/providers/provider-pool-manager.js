@@ -13,7 +13,7 @@ import {
 } from './provider-models.js';
 import { broadcastEvent } from '../ui-modules/event-broadcast.js';
 import { ENDPOINT_TYPE } from '../utils/common.js';
-import { extractQuotaWindows, GreedyStickyScheduler } from './greedy-sticky-scheduler.js';
+import { extractQuotaWindows, quotaFamilyForModel, QUOTA_FAMILY_THIRD_PARTY, GreedyStickyScheduler } from './greedy-sticky-scheduler.js';
 
 function getCustomModelAliasesForProvider(config, providerType) {
     const customModels = Array.isArray(config?.customModels) ? config.customModels : [];
@@ -1148,12 +1148,12 @@ export class ProviderPoolManager {
     }
 
     _formatQuotaWindows(windows) {
-        const weekly = windows?.weekly;
-        const fiveHour = windows?.fiveHour;
         const part = (label, window) => window
             ? `${label} ${Math.round(window.remainingFraction * 100)}% until ${window.resetAt}`
             : `${label} unavailable`;
-        return `${part('weekly', weekly)}; ${part('5h', fiveHour)}`;
+        const gemini = windows?.gemini || { weekly: windows?.weekly, fiveHour: windows?.fiveHour };
+        const thirdParty = windows?.thirdParty || {};
+        return `gemini ${part('weekly', gemini.weekly)}; ${part('5h', gemini.fiveHour)} | 3p ${part('weekly', thirdParty.weekly)}; ${part('5h', thirdParty.fiveHour)}`;
     }
 
     _usesGreedySticky(providerType) {
@@ -1163,16 +1163,28 @@ export class ProviderPoolManager {
     _greedyAccountView(providerType, requestedModel, options = {}) {
         const excluded = new Set(Array.isArray(options.excludeUuids) ? options.excludeUuids : []);
         this._checkAndRecoverScheduledProviders(providerType);
+        const family = quotaFamilyForModel(requestedModel);
         return (this.providerStatus[providerType] || [])
             .filter(provider => provider.config.isHealthy && !provider.config.isDisabled && !excluded.has(provider.config.uuid))
             .filter(provider => this._supportsRequestedModel(providerType, provider, requestedModel))
             .map(provider => ({
                 uuid: provider.config.uuid,
                 config: provider.config,
-                weekly: provider.config.quotaWindows?.weekly || null,
-                fiveHour: provider.config.quotaWindows?.fiveHour || null,
+                // 当前请求模型族的额度窗口（Gemini 族读 gemini-* 桶，Claude/GPT 族读 3p-* 桶），
+                // 调度器按这份窗口打分与判饱和；另一族的数据仍留在 config.quotaWindows 里。
+                weekly: this._familyWindowsFor(provider.config, family).weekly,
+                fiveHour: this._familyWindowsFor(provider.config, family).fiveHour,
+                family,
                 updatedAt: provider.config.quotaWindowsUpdatedAt || 0
             }));
+    }
+
+    _familyWindowsFor(config, family) {
+        const windows = config?.quotaWindows || {};
+        if (family === QUOTA_FAMILY_THIRD_PARTY) {
+            return windows.thirdParty || { weekly: null, fiveHour: null };
+        }
+        return windows.gemini || { weekly: windows.weekly || null, fiveHour: windows.fiveHour || null };
     }
 
     _supportsRequestedModel(providerType, provider, requestedModel) {
@@ -1188,7 +1200,8 @@ export class ProviderPoolManager {
         const decision = await this.accountScheduler.acquire({
             uuid: options.stickyUuid,
             sessionId: options.sessionId,
-            accounts
+            accounts,
+            family: quotaFamilyForModel(requestedModel)
         });
         if (decision.status === 'quota-exhausted') {
             const error = new Error(`Antigravity quota exhausted${decision.resetAt ? `; earliest reset ${decision.resetAt}` : ''}`);
@@ -1276,14 +1289,22 @@ export class ProviderPoolManager {
                     ? await service.antigravityApiService.getQuotaSummary()
                     : null;
                 const windows = extractQuotaWindows(usage);
-                if (!windows.weekly || !windows.fiveHour) {
+                const gemini = windows.gemini || {};
+                if (!gemini.weekly || !gemini.fiveHour) {
                     this.accountScheduler.lastRefreshAt.delete(uuid);
                     this._log('warn', `[Quota Refresh] ${reason} ${displayName}: incomplete quota, keeping the last known result`);
                     continue;
                 }
                 provider.config.quotaWindows = windows;
                 provider.config.quotaWindowsUpdatedAt = Date.now();
-                this.accountScheduler.updateAccount(uuid, { uuid, ...windows });
+                this.accountScheduler.updateAccount(uuid, {
+                    uuid,
+                    gemini: windows.gemini,
+                    thirdParty: windows.thirdParty
+                });
+                // 刷新读回了真实窗口，该号按账本的 429 冷却随之解除（若仍耗尽，
+                // 下一轮请求会按新窗口继续避开，不依赖冷却）。
+                this.clearFamilyCooldowns(uuid);
                 this._log('info', `[Quota Refresh] ${reason} ${displayName}: ${this._formatQuotaWindows(windows)}`);
             } catch (error) {
                 this._log('warn', `[Quota Refresh] ${reason} failed for ${displayName}: ${error.message}`);
@@ -1971,6 +1992,27 @@ export class ProviderPoolManager {
 
             this._debouncedSave(providerType);
         }
+    }
+
+    /**
+     * 按账本（模型族）级冷却：仅用于 429 额度耗尽。只屏蔽某号在出事模型族上的
+     * 请求（如 gemini 桶耗尽只挡 Gemini 单），另一族（3p 满额的 Claude 单）照常
+     * 被调度。账号本身的 isHealthy 不动；到恢复时间或下次额度刷新即解除。
+     */
+    markFamilyCooldownWithRecoveryTime(providerType, providerConfig, family, recoveryTime) {
+        if (!providerConfig?.uuid || !family || !recoveryTime) return;
+        const recoveryDate = recoveryTime instanceof Date ? recoveryTime : new Date(recoveryTime);
+        if (Number.isNaN(recoveryDate.getTime()) || recoveryDate.getTime() <= Date.now()) return;
+        this.accountScheduler?.setFamilyCooldown(providerConfig.uuid, family, recoveryDate.getTime());
+        // 把族的冷却窗口同时写进该号在调度器里的额度记忆，让 waitForChange 等
+        // 等待路径也能在冷却解除后被唤醒。
+        this._log('warn', `Family cooldown applied: ${this._getDisplayName(providerConfig)} ${family} quota exhausted; blocking ${family} requests until ${recoveryDate.toISOString()}, other families keep serving`);
+    }
+
+    /** 额度刷新读回真实窗口后解除该号的按账本冷却。 */
+    clearFamilyCooldowns(uuid, family = null) {
+        if (!uuid) return;
+        this.accountScheduler?.clearFamilyCooldown(uuid, family);
     }
 
     /**
