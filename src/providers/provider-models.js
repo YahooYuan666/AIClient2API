@@ -102,6 +102,7 @@ export const PROVIDER_MODELS = {
     'openai-custom': [],
     'atlascloud': [],
     'qiniu': [],
+    'apimart': [],
     'fenno': [],
     'openaiResponses-custom': [],
     'openai-qwen-oauth': [
@@ -195,6 +196,7 @@ export const MANAGED_MODEL_LIST_PROVIDERS = [
     'claude-custom',
     'atlascloud',
     'qiniu',
+    'apimart',
     'fenno',
     'github-copilot'
 ];

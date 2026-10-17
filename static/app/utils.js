@@ -13,6 +13,13 @@ import { apiClient } from './auth.js';
  */
 function getBaseProviderConfigs() {
     return [
+        {
+            id: 'apimart',
+            name: 'APIMart',
+            icon: 'fa-images',
+            registerUrl: 'https://go.apimart.ai/gh-aiclient2api',
+            docUrl: 'https://docs.apimart.ai/'
+        },
         { 
             id: 'qiniu', 
             name: 'Qiniu Cloud AI', 
@@ -313,6 +320,20 @@ function getProviderTypeFields(providerType) {
                 label: 'OpenAI Base URL',
                 type: 'text',
                 placeholder: 'https://api.qnaigc.com/v1'
+            }
+        ],
+        'apimart': [
+            {
+                id: 'OPENAI_API_KEY',
+                label: t('modal.provider.field.apiKey'),
+                type: 'password',
+                placeholder: 'sk-...'
+            },
+            {
+                id: 'OPENAI_BASE_URL',
+                label: 'OpenAI Base URL',
+                type: 'text',
+                placeholder: 'https://api.apimart.ai/v1'
             }
         ],
         'fenno': [

@@ -189,6 +189,7 @@ function getProviderDisplayName(providerType) {
         'openai-custom': 'OpenAI Custom',
         'atlascloud': 'AtlasCloud',
         'qiniu': 'Qiniu Cloud AI',
+        'apimart': 'APIMart',
         'fenno': 'Fenno.ai',
         'openaiResponses-custom': 'OpenAI Responses Custom',
         'openai-qwen-oauth': 'Qwen (OAuth)',

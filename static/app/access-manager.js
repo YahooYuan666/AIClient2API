@@ -13,6 +13,7 @@ const recommendedModelMap = {
     'openai-custom': 'gpt-5.5',
     'atlascloud': 'gpt-5.5',
     'qiniu': 'gpt-5.5',
+    'apimart': 'gpt-5',
     'fenno': 'gpt-5.5',
     'openai-qwen-oauth': 'qwen3-coder-plus',
     'openai-iflow': 'qwen3-max',

@@ -3,11 +3,13 @@
 import { escapeHtml, showToast, getFieldLabel, getProviderTypeFields } from './utils.js';
 import { handleProviderPasswordToggle } from './event-handlers.js';
 import { t } from './i18n.js';
+import { createCodexQuotaBadgeLoader } from './codex-quota-badges.js';
 
-const MANAGED_MODEL_LIST_PROVIDERS = new Set(['openai-custom', 'openaiResponses-custom', 'claude-custom', 'atlascloud', 'qiniu', 'fenno']);
+const MANAGED_MODEL_LIST_PROVIDERS = new Set(['openai-custom', 'openaiResponses-custom', 'claude-custom', 'atlascloud', 'qiniu', 'apimart', 'fenno']);
 const COPILOT_QUOTA_CACHE_TTL_MS = 60_000;
 const copilotQuotaCache = new Map();
 const copilotQuotaRequests = new Map();
+const loadCodexQuotaBadges = createCodexQuotaBadgeLoader({ apiClient: window.apiClient, translate: t });
 
 // 分页配置
 const PROVIDERS_PER_PAGE = 5;
@@ -608,6 +610,8 @@ function goToProviderPage(page) {
         providerList.innerHTML = renderProviderListPaginated(filteredProviders, page);
         if (currentProviderType === 'github-copilot') {
             loadCopilotQuotaBadges(providerList);
+        } else if (currentProviderType === 'openai-codex-oauth') {
+            loadCodexQuotaBadges(providerList);
         }
     }
     
@@ -950,6 +954,7 @@ function renderProviderDetailList(providers) {
                         <div class="provider-name">
                             ${provider.customName || provider.uuid}
                             ${currentProviderType === 'github-copilot' ? `<span class="copilot-quota-badge" data-provider-uuid="${escapeHtml(provider.uuid)}">${t('providers.copilotQuota.loading')}</span>` : ''}
+                            ${currentProviderType === 'openai-codex-oauth' ? `<span class="codex-quota-badge" data-provider-uuid="${escapeHtml(provider.uuid)}">${t('providers.codexQuota.loading')}</span>` : ''}
                             ${needsRefresh ? `<span class="badge badge-warning" style="font-size: 10px; margin-left: 8px; vertical-align: middle;"><i class="fas fa-sync-alt fa-spin"></i> <span data-i18n="providers.status.needsRefresh">${t('providers.status.needsRefresh')}</span></span>` : ''}
                         </div>
                         <div class="provider-meta">
@@ -1027,7 +1032,7 @@ function renderProviderCardList(providers) {
             <div class="provider-item-card ${healthClass} ${disabledClass}" data-uuid="${provider.uuid}">
                 <div class="card-header">
                     <div class="card-status-dot"></div>
-                    <div class="card-name" title="${displayName}">${displayName}${currentProviderType === 'github-copilot' ? `<span class="copilot-quota-badge" data-provider-uuid="${escapeHtml(provider.uuid)}">${t('providers.copilotQuota.loading')}</span>` : ''}</div>
+                    <div class="card-name" title="${displayName}">${displayName}${currentProviderType === 'github-copilot' ? `<span class="copilot-quota-badge" data-provider-uuid="${escapeHtml(provider.uuid)}">${t('providers.copilotQuota.loading')}</span>` : ''}${currentProviderType === 'openai-codex-oauth' ? `<span class="codex-quota-badge" data-provider-uuid="${escapeHtml(provider.uuid)}">${t('providers.codexQuota.loading')}</span>` : ''}</div>
                     ${needsRefresh ? '<i class="fas fa-sync-alt fa-spin card-refresh-icon"></i>' : ''}
                 </div>
                 <div class="card-body">
@@ -1636,6 +1641,8 @@ async function refreshProviderConfig(providerType, { loadCopilotQuotas = false }
                 providerList.innerHTML = renderProviderListPaginated(data.providers, currentPage);
                 if (providerType === 'github-copilot') {
                     loadCopilotQuotaBadges(providerList, { requestMissing: loadCopilotQuotas });
+                } else if (providerType === 'openai-codex-oauth') {
+                    loadCodexQuotaBadges(providerList);
                 }
             }
             

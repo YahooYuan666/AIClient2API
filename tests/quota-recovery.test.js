@@ -112,27 +112,30 @@ describe('Google quota metadata parsing', () => {
         expect(isQuotaExhaustedError(quotaError({ body: exhaustedBody() }))).toBe(true);
     });
 
-    test('an absolute reset time wins even when an earlier detail only has a short delay', () => {
-        const recovery = getQuotaRecoveryTime(quotaError({
-            body: [{
-                error: {
-                    status: 'RESOURCE_EXHAUSTED',
-                    details: [
-                        { retryDelay: '5s' },
-                        { metadata: { quotaResetTimeStamp: '2026-10-09T18:00:00.000Z' } }
-                    ]
-                }
-            }]
-        }), now);
-        expect(recovery.toISOString()).toBe('2026-10-09T18:00:00.000Z');
-    });
-
     test('reads hours, minutes and seconds from a raw string body', () => {
         const recovery = getQuotaRecoveryTime(quotaError({
             asString: true,
             body: exhaustedBody({ quotaResetDelay: '3h48m29s' })
         }), now);
         expect(recovery.getTime() - now).toBe((3 * 3600 + 48 * 60 + 29) * 1000);
+    });
+
+    test('an absolute reset time wins even when a short delay is listed first', () => {
+        const bodyFor = details => [{ error: { status: 'RESOURCE_EXHAUSTED', details } }];
+        const first = getQuotaRecoveryTime(quotaError({
+            body: bodyFor([
+                { retryDelay: '60s' },
+                { metadata: { quotaResetTimeStamp: '2027-01-01T00:00:00Z' } }
+            ])
+        }), now);
+        const reversed = getQuotaRecoveryTime(quotaError({
+            body: bodyFor([
+                { metadata: { quotaResetTimeStamp: '2027-01-01T00:00:00Z' } },
+                { retryDelay: '60s' }
+            ])
+        }), now);
+        expect(first.toISOString()).toBe('2027-01-01T00:00:00.000Z');
+        expect(reversed.toISOString()).toBe(first.toISOString());
     });
 
     test('plain 429 and Retry-After are not quota exhaustion', () => {
@@ -206,6 +209,68 @@ describe('quota exhaustion does not spin on the same account', () => {
         expect(second.generateContentStream).toHaveBeenCalledTimes(1);
     });
 
+    test('a plain 429 without quota metadata still uses the short cooldown path', async () => {
+        const manager = poolWith([{ uuid: 'only' }], 'only');
+        const error = new Error('too many requests');
+        error.status = 429;
+        error.response = { status: 429, data: { error: { message: 'slow down' } } };
+        await runStream(error, manager, 0);
+        expect(manager.markProviderUnhealthyWithRecoveryTime).not.toHaveBeenCalled();
+        expect(manager.markProviderUnhealthy).toHaveBeenCalled();
+    });
+
+    test('one account without a parseable recovery time is not selected again', async () => {
+        const manager = poolWith([{ uuid: 'only' }], 'only');
+        const { elapsed } = await runStream(quotaError({ body: exhaustedBody() }), manager);
+        expect(elapsed).toBeLessThan(1500);
+        expect(mockGetApiServiceWithFallback).not.toHaveBeenCalled();
+        expect(manager.markProviderHealthy).not.toHaveBeenCalled();
+    });
+
+    test('a configured healthy fallback provider is used when the current pool is exhausted', async () => {
+        const manager = poolWith([{ uuid: 'only' }], 'only');
+        manager.fallbackChain = { 'gemini-antigravity': ['gemini-cli-oauth'] };
+        manager.providerStatus['gemini-cli-oauth'] = [{
+            uuid: 'backup',
+            config: { uuid: 'backup', isHealthy: true }
+        }];
+        const backup = failingService(Object.assign(new Error('backup answered'), { status: 400, response: { status: 400, data: {} } }));
+        mockGetApiServiceWithFallback.mockResolvedValueOnce({
+            service: backup,
+            uuid: 'backup',
+            actualProviderType: 'gemini-cli-oauth',
+            actualModel: 'gemini-3.8-flash-high',
+            serviceConfig: {}
+        });
+        await runStream(quotaError({ body: exhaustedBody() }), manager);
+        expect(mockGetApiServiceWithFallback).toHaveBeenCalledTimes(1);
+        expect(mockGetApiServiceWithFallback.mock.calls[0][2].excludeUuids).toEqual(['only']);
+        expect(backup.generateContentStream).toHaveBeenCalledTimes(1);
+    });
+
+
+    test('a second exhausted account stays excluded together with the first', async () => {
+        const manager = poolWith([{ uuid: 'first' }, { uuid: 'second' }, { uuid: 'third' }], 'first');
+        const secondError = quotaError({ body: exhaustedBody() });
+        const second = failingService(secondError);
+        const third = failingService(Object.assign(new Error('stop'), { status: 400, response: { status: 400, data: {} } }));
+        mockGetApiServiceWithFallback
+            .mockResolvedValueOnce({
+                service: second, uuid: 'second', actualProviderType: 'gemini-antigravity',
+                actualModel: 'gemini-3.8-flash-high', serviceConfig: {}
+            })
+            .mockResolvedValueOnce({
+                service: third, uuid: 'third', actualProviderType: 'gemini-antigravity',
+                actualModel: 'gemini-3.8-flash-high', serviceConfig: {}
+            });
+
+        await runStream(quotaError({ body: exhaustedBody() }), manager);
+
+        expect(mockGetApiServiceWithFallback).toHaveBeenCalledTimes(2);
+        expect(mockGetApiServiceWithFallback.mock.calls[0][2].excludeUuids).toEqual(['first']);
+        expect(mockGetApiServiceWithFallback.mock.calls[1][2].excludeUuids).toEqual(['first', 'second']);
+    });
+
     test('a model mapping can take over when the current pool is exhausted', async () => {
         const manager = poolWith([{ uuid: 'only' }], 'only');
         manager.modelFallbackMapping = {
@@ -254,67 +319,6 @@ describe('quota exhaustion does not spin on the same account', () => {
         );
         expect(mockGetApiServiceWithFallback).toHaveBeenCalledTimes(1);
         expect(backup.generateContent).toHaveBeenCalledTimes(1);
-    });
-
-    test('a second exhausted account stays excluded together with the first', async () => {
-        const manager = poolWith([{ uuid: 'first' }, { uuid: 'second' }, { uuid: 'third' }], 'first');
-        const secondError = quotaError({ body: exhaustedBody() });
-        const second = failingService(secondError);
-        const third = failingService(Object.assign(new Error('stop'), { status: 400, response: { status: 400, data: {} } }));
-        mockGetApiServiceWithFallback
-            .mockResolvedValueOnce({
-                service: second, uuid: 'second', actualProviderType: 'gemini-antigravity',
-                actualModel: 'gemini-3.8-flash-high', serviceConfig: {}
-            })
-            .mockResolvedValueOnce({
-                service: third, uuid: 'third', actualProviderType: 'gemini-antigravity',
-                actualModel: 'gemini-3.8-flash-high', serviceConfig: {}
-            });
-
-        await runStream(quotaError({ body: exhaustedBody() }), manager);
-
-        expect(mockGetApiServiceWithFallback).toHaveBeenCalledTimes(2);
-        expect(mockGetApiServiceWithFallback.mock.calls[0][2].excludeUuids).toEqual(['first']);
-        expect(mockGetApiServiceWithFallback.mock.calls[1][2].excludeUuids).toEqual(['first', 'second']);
-    });
-
-    test('a plain 429 without quota metadata still uses the short cooldown path', async () => {
-        const manager = poolWith([{ uuid: 'only' }], 'only');
-        const error = new Error('too many requests');
-        error.status = 429;
-        error.response = { status: 429, data: { error: { message: 'slow down' } } };
-        await runStream(error, manager, 0);
-        expect(manager.markProviderUnhealthyWithRecoveryTime).not.toHaveBeenCalled();
-        expect(manager.markProviderUnhealthy).toHaveBeenCalled();
-    });
-
-    test('one account without a parseable recovery time is not selected again', async () => {
-        const manager = poolWith([{ uuid: 'only' }], 'only');
-        const { elapsed } = await runStream(quotaError({ body: exhaustedBody() }), manager);
-        expect(elapsed).toBeLessThan(1500);
-        expect(mockGetApiServiceWithFallback).not.toHaveBeenCalled();
-        expect(manager.markProviderHealthy).not.toHaveBeenCalled();
-    });
-
-    test('a configured healthy fallback provider is used when the current pool is exhausted', async () => {
-        const manager = poolWith([{ uuid: 'only' }], 'only');
-        manager.fallbackChain = { 'gemini-antigravity': ['gemini-cli-oauth'] };
-        manager.providerStatus['gemini-cli-oauth'] = [{
-            uuid: 'backup',
-            config: { uuid: 'backup', isHealthy: true }
-        }];
-        const backup = failingService(Object.assign(new Error('backup answered'), { status: 400, response: { status: 400, data: {} } }));
-        mockGetApiServiceWithFallback.mockResolvedValueOnce({
-            service: backup,
-            uuid: 'backup',
-            actualProviderType: 'gemini-cli-oauth',
-            actualModel: 'gemini-3.8-flash-high',
-            serviceConfig: {}
-        });
-        await runStream(quotaError({ body: exhaustedBody() }), manager);
-        expect(mockGetApiServiceWithFallback).toHaveBeenCalledTimes(1);
-        expect(mockGetApiServiceWithFallback.mock.calls[0][2].excludeUuids).toEqual(['only']);
-        expect(backup.generateContentStream).toHaveBeenCalledTimes(1);
     });
 
     test('unary requests with one account also return immediately', async () => {

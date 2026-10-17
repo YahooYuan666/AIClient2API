@@ -62,6 +62,7 @@ export const MODEL_PROVIDER = {
     OPENAI_CUSTOM: 'openai-custom',
     ATLASCLOUD: 'atlascloud',
     QINIU: 'qiniu',
+    APIMART: 'apimart',
     FENNO: 'fenno',
     OPENAI_CUSTOM_RESPONSES: 'openaiResponses-custom',
     CLAUDE_CUSTOM: 'claude-custom',

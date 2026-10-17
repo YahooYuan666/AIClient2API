@@ -177,6 +177,16 @@
   </tr>
   <tr>
     <td width="25%" align="center" valign="middle">
+      <a href="https://go.apimart.ai/gh-aiclient2api">
+        <img src="static/apimart.png" alt="APIMart Sponsor" width="180">
+      </a>
+    </td>
+    <td width="75%" align="left" valign="middle">
+      APIMart による本プロジェクトへのご支援に感謝します！APIMart は AI 画像・動画生成に特化した低価格 API プラットフォームです。GPT-Image-2 は 1 枚 $0.006 から、1 ドルで 160 枚以上の画像を生成できます。画像も動画も共通の非同期 API で対応：タスクを送信して ID を取得し、ポーリングまたはコールバックで結果を受け取れます。数万枚の画像をタイムアウトなしで一括生成でき、モデルの切り替えにもコード変更は不要です。月額料金なしの従量課金制 — <a href="https://go.apimart.ai/gh-aiclient2api">こちらから登録</a>してすぐに利用を開始できます。
+    </td>
+  </tr>
+  <tr>
+    <td width="25%" align="center" valign="middle">
       <a href="https://www.runninghub.ai/call-api?source=github">
         <img src="static/runninghub.png" alt="RunningHub Sponsor" width="180">
       </a>

@@ -583,6 +583,7 @@ export async function getProviderStatus(config, options = {}) {
         'openai-custom': 'OPENAI_BASE_URL',
         'atlascloud': 'OPENAI_BASE_URL',
         'qiniu': 'OPENAI_BASE_URL',
+        'apimart': 'OPENAI_BASE_URL',
         'fenno': 'OPENAI_BASE_URL',
         'openaiResponses-custom': 'OPENAI_BASE_URL',
         'gemini-cli-oauth': 'GEMINI_OAUTH_CREDS_FILE_PATH',

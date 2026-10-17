@@ -196,6 +196,76 @@ describe('Gemini → Claude stream protocol (#718)', () => {
         expect(stops(out)).toHaveLength(2);
     });
 
+    function responsesMixed({ textFirst, thinking = false }) {
+        const textIndex = textFirst ? 0 : 1;
+        const toolIndex = textFirst ? 1 : 0;
+        const textOpen = thinking
+            ? { type: 'response.reasoning_summary_text.delta', output_index: textIndex, item_id: 'msg-a', delta: 'Checking Paris' }
+            : { type: 'response.content_part.added', output_index: textIndex, item_id: 'msg-a', content_index: 0, part: { type: 'output_text' } };
+        const textDelta = thinking
+            ? null
+            : { type: 'response.output_text.delta', output_index: textIndex, item_id: 'msg-a', content_index: 0, delta: 'Checking Paris' };
+        const textDone = thinking
+            ? { type: 'response.reasoning_summary_text.done', output_index: textIndex, item_id: 'msg-a' }
+            : { type: 'response.output_text.done', output_index: textIndex, item_id: 'msg-a', content_index: 0 };
+        const textItem = [textOpen, textDelta, textDone].filter(Boolean);
+        const toolItem = [
+            { type: 'response.output_item.added', output_index: toolIndex, item: { type: 'function_call', id: 'item-a', call_id: 'call-a', name: 'get_city' } },
+            { type: 'response.function_call_arguments.delta', output_index: toolIndex, item_id: 'item-a', delta: '{"city":"' },
+            { type: 'response.function_call_arguments.delta', output_index: toolIndex, item_id: 'item-a', delta: 'Paris"}' },
+            { type: 'response.function_call_arguments.done', output_index: toolIndex, item_id: 'item-a' },
+            { type: 'response.output_item.done', output_index: toolIndex, item: { type: 'function_call', id: 'item-a', call_id: 'call-a', name: 'get_city', arguments: '{"city":"Paris"}' } }
+        ];
+        const opened = textFirst ? [...textItem.slice(0, 1), ...toolItem.slice(0, 1)] : [...toolItem.slice(0, 1), ...textItem.slice(0, 1)];
+        const middle = [
+            toolItem[1],
+            ...(thinking ? [] : [textItem[1]]),
+            toolItem[2]
+        ];
+        const closed = textFirst
+            ? [textItem[textItem.length - 1], ...toolItem.slice(3)]
+            : [...toolItem.slice(3), textItem[textItem.length - 1]];
+        return [
+            { type: 'response.created', response: { id: 'resp-1', model: 'gpt' } },
+            ...opened,
+            ...middle,
+            ...closed,
+            { type: 'response.completed', response: { output: [], usage: { input_tokens: 1, output_tokens: 1 } } }
+        ];
+    }
+
+    async function expectMixedResponses(native, textType) {
+        const { out } = await run({
+            nativeChunks: native,
+            fromProvider: 'claude',
+            toProvider: 'grok-cli-oauth'
+        });
+        const tool = starts(out).find(x => x.data.content_block.type === 'tool_use');
+        const text = starts(out).find(x => x.data.content_block.type === textType);
+        const joined = (index, deltaType, field) => deltas(out)
+            .filter(x => x.data.index === index && x.data.delta?.type === deltaType)
+            .map(x => x.data.delta[field])
+            .join('');
+        expect(JSON.parse(joined(tool.data.index, 'input_json_delta', 'partial_json'))).toEqual({ city: 'Paris' });
+        expect(joined(text.data.index, textType === 'thinking' ? 'thinking_delta' : 'text_delta', textType === 'thinking' ? 'thinking' : 'text')).toBe('Checking Paris');
+        expect(starts(out)).toHaveLength(2);
+        expect(stops(out)).toHaveLength(2);
+        const startIndexes = starts(out).map(x => x.data.index);
+        expect(new Set(stops(out).map(x => x.data.index))).toEqual(new Set(startIndexes));
+    }
+
+    test('Responses tool opened before text keeps both blocks when their deltas interleave', async () => {
+        await expectMixedResponses(responsesMixed({ textFirst: false }), 'text');
+    });
+
+    test('Responses text opened before the tool keeps the tool arguments parseable', async () => {
+        await expectMixedResponses(responsesMixed({ textFirst: true }), 'text');
+    });
+
+    test('Responses thinking opened before the tool keeps the tool arguments parseable', async () => {
+        await expectMixedResponses(responsesMixed({ textFirst: true, thinking: true }), 'thinking');
+    });
+
     test('synthetic text block closes when the message ends even without a tool call', async () => {
         const { out } = await run({ nativeChunks: [
             geminiChunk({ text: 'Hello' }),

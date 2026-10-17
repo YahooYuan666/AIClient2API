@@ -11,6 +11,7 @@ import { updateUsageProviderConfigs } from './usage-manager.js';
 import { updateConfigProviderConfigs } from './config-manager.js';
 import { loadConfigList, updateProviderFilterOptions } from './upload-config-manager.js';
 import { setServiceMode } from './event-handlers.js';
+import { createCopilotQuotaUsageLoader } from './copilot-quota-summary.js';
 
 // 保存初始服务器时间和运行时间
 let initialServerTime = null;
@@ -19,6 +20,7 @@ let initialLoadTime = null;
 let isStaticProviderConfigsUpdated = false;
 let cachedSupportedProviders = null;
 let latestProvidersAccessInfo = null;
+const loadCopilotQuotaUsage = createCopilotQuotaUsageLoader({ apiClient: window.apiClient });
 
 function navigateToSection(sectionId) {
     const navItem = document.querySelector(`.nav-item[data-section="${sectionId}"]`);
@@ -456,6 +458,11 @@ function renderProviders(providers, supportedProviders = []) {
                     <span class="provider-stat-label" data-i18n="providers.stat.errorCount">${t('providers.stat.errorCount')}</span>
                     <span class="provider-stat-value">${errorCount}</span>
                 </div>
+                ${providerType === 'github-copilot' ? `
+                <div class="provider-stat copilot-quota-stat" title="${t('providers.copilotQuota.summaryTitle')}">
+                    <span class="provider-stat-label" data-i18n="providers.stat.copilotQuotaUsed">${t('providers.stat.copilotQuotaUsed')}</span>
+                    <span class="provider-stat-value copilot-quota-stat-value">${t('providers.copilotQuota.loading')}</span>
+                </div>` : ''}
             </div>
         `;
 
@@ -471,6 +478,16 @@ function renderProviders(providers, supportedProviders = []) {
         });
 
         container.appendChild(providerDiv);
+
+        if (providerType === 'github-copilot') {
+            const quotaValue = providerDiv.querySelector('.copilot-quota-stat-value');
+            loadCopilotQuotaUsage(accounts).then(result => {
+                if (!quotaValue) return;
+                quotaValue.textContent = result.available
+                    ? `${Math.round(result.usedPercent)}% / ${Math.round(result.totalPercent)}%`
+                    : t('providers.copilotQuota.unavailable');
+            });
+        }
         
         // 为添加分组按钮添加事件监听
         const addGroupBtn = providerDiv.querySelector('.add-group-btn');
@@ -974,7 +991,7 @@ function showSimplePrompt(title, placeholder, callback) {
  * @returns {string} 按钮HTML
  */
 function generateAddGroupButton(providerType) {
-    const allowedTypes = ['claude-custom', 'openai-custom', 'openaiResponses-custom', 'atlascloud', 'qiniu', 'fenno'];
+    const allowedTypes = ['claude-custom', 'openai-custom', 'openaiResponses-custom', 'atlascloud', 'qiniu', 'apimart', 'fenno'];
     if (!allowedTypes.includes(providerType)) {
         return '';
     }
@@ -4834,7 +4851,7 @@ function showAddProviderGroupModal(defaultBaseType = null) {
         const isSupported = cachedSupportedProviders.includes(config.id);
         
         // 2. 限制只能添加特定类型的配置组 (Claude Custom, OpenAI Custom, OpenAI Responses)
-        const allowedTypes = ['claude-custom', 'openai-custom', 'openaiResponses-custom', 'atlascloud', 'qiniu', 'fenno'];
+        const allowedTypes = ['claude-custom', 'openai-custom', 'openaiResponses-custom', 'atlascloud', 'qiniu', 'apimart', 'fenno'];
         const isAllowed = allowedTypes.includes(config.id);
         
         return isSupported && isAllowed;

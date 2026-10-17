@@ -23,6 +23,7 @@ const MODEL_PROVIDER = {
     OPENAI_CUSTOM: 'openai-custom',
     ATLASCLOUD: 'atlascloud',
     QINIU: 'qiniu',
+    APIMART: 'apimart',
     FENNO: 'fenno',
     CLAUDE_CUSTOM: 'claude-custom',
     KIRO_API: 'claude-kiro-oauth',
@@ -219,6 +220,27 @@ describe('API Integration Tests with HTTP Requests', () => {
             expect(response.status).toBe(200);
             expect(response.headers.get('content-type')).toContain('application/json');
             
+            const responseData = await response.json();
+            expect(responseData).toHaveProperty('choices');
+            expect(Array.isArray(responseData.choices)).toBe(true);
+            expect(responseData.choices.length).toBeGreaterThan(0);
+            expect(responseData.choices[0]).toHaveProperty('message');
+            expect(responseData.choices[0].message).toHaveProperty('content');
+        });
+
+        test('OpenAI /v1/chat/completions non-streaming with APIMart provider', async () => {
+            REAL_TEST_DATA.openai.nonStreamRequest.model = "gpt-5";
+            const response = await makeRequest(
+                `${TEST_SERVER_BASE_URL}/v1/chat/completions`,
+                'POST',
+                'bearer',
+                { 'model-provider': MODEL_PROVIDER.APIMART },
+                REAL_TEST_DATA.openai.nonStreamRequest
+            );
+
+            expect(response.status).toBe(200);
+            expect(response.headers.get('content-type')).toContain('application/json');
+
             const responseData = await response.json();
             expect(responseData).toHaveProperty('choices');
             expect(Array.isArray(responseData.choices)).toBe(true);
@@ -605,6 +627,22 @@ describe('API Integration Tests with HTTP Requests', () => {
             expect(response.status).toBe(200);
             expect(response.headers.get('content-type')).toContain('application/json');
             
+            const responseData = await response.json();
+            expect(responseData).toHaveProperty('data');
+            expect(Array.isArray(responseData.data)).toBe(true);
+        });
+
+        test('OpenAI /v1/models APIMart', async () => {
+            const response = await makeRequest(
+                `${TEST_SERVER_BASE_URL}/v1/models`,
+                'GET',
+                'bearer',
+                { 'model-provider': MODEL_PROVIDER.APIMART }
+            );
+
+            expect(response.status).toBe(200);
+            expect(response.headers.get('content-type')).toContain('application/json');
+
             const responseData = await response.json();
             expect(responseData).toHaveProperty('data');
             expect(Array.isArray(responseData.data)).toBe(true);

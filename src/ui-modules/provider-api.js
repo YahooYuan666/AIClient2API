@@ -302,11 +302,46 @@ export async function handleGetProviderType(req, res, currentConfig, providerPoo
     return true;
 }
 
-/**
- * Read Copilot quota for one PAT-backed provider node.
- */
+function normalizeCodexResetAt(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const timestamp = Number(value);
+    if (!Number.isFinite(timestamp)) return null;
+    return timestamp < 1e12 ? timestamp * 1000 : timestamp;
+}
+
+export function normalizeCodexQuota(usage = {}) {
+    const rateLimit = usage.rate_limit || usage.rateLimit || {};
+    const sourceWindows = [rateLimit.primary_window || rateLimit.primaryWindow, rateLimit.secondary_window || rateLimit.secondaryWindow]
+        .filter(Boolean);
+    const durationKey = minutes => minutes === 300 ? '5h' : minutes === 10080 ? 'weekly' : minutes === 43200 ? 'monthly' : 'other';
+    const windows = sourceWindows.flatMap(window => {
+        const rawUsedPercentage = window.used_percent ?? window.usedPercent;
+        if (rawUsedPercentage === null || rawUsedPercentage === undefined ||
+            (typeof rawUsedPercentage !== 'number' && typeof rawUsedPercentage !== 'string') ||
+            (typeof rawUsedPercentage === 'string' && rawUsedPercentage.trim() === '')) {
+            return [];
+        }
+        const usedPercentage = Number(rawUsedPercentage);
+        if (!Number.isFinite(usedPercentage)) return [];
+
+        const durationMinutes = Number(window.duration_minutes ?? window.durationMinutes ?? ((window.limit_window_seconds ?? window.limitWindowSeconds ?? 0) / 60)) || 0;
+        return {
+            key: durationKey(durationMinutes),
+            usedPercentage,
+            durationMinutes,
+            resetsAt: normalizeCodexResetAt(window.reset_at ?? window.resetAt)
+        };
+    });
+    return {
+        available: windows.length > 0,
+        planType: usage.plan_type || usage.planType || usage.plan || 'unknown',
+        windows
+    };
+}
+
+/** Read provider quota for one account node. */
 export async function handleGetProviderQuota(req, res, currentConfig, providerPoolManager, providerType, providerUuid) {
-    if (providerType !== 'github-copilot') {
+    if (!['github-copilot', 'openai-codex-oauth'].includes(providerType)) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: 'Quota lookup is not supported for this provider.' } }));
         return true;
@@ -330,20 +365,22 @@ export async function handleGetProviderQuota(req, res, currentConfig, providerPo
         delete serviceConfig.providerPools;
 
         const serviceAdapter = getServiceAdapter(serviceConfig);
-        if (typeof serviceAdapter.getQuota !== 'function') {
+        const method = providerType === 'openai-codex-oauth' ? 'getUsageLimits' : 'getQuota';
+        if (typeof serviceAdapter[method] !== 'function') {
             res.writeHead(501, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: { message: 'Quota lookup is not supported by this adapter.' } }));
             return true;
         }
 
-        const quota = await serviceAdapter.getQuota();
+        const rawQuota = await serviceAdapter[method]();
+        const quota = providerType === 'openai-codex-oauth' ? normalizeCodexQuota(rawQuota) : rawQuota;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ providerType, providerUuid, quota }));
         return true;
     } catch (error) {
-        logger.warn(`[UI API] Copilot quota lookup failed for provider ${providerUuid}: ${error.message}`);
+        logger.warn(`[UI API] ${providerType} quota lookup failed for provider ${providerUuid}: ${error.message}`);
         res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Unable to retrieve GitHub Copilot quota.' } }));
+        res.end(JSON.stringify({ error: { message: `Unable to retrieve ${providerType} quota.` } }));
         return true;
     }
 }

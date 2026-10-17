@@ -189,6 +189,17 @@ function getAvailableRoutes() {
             badgeClass: 'official'
         },
         {
+            provider: 'apimart',
+            name: 'APIMart',
+            paths: {
+                openai: '/apimart/v1/chat/completions',
+                claude: '/apimart/v1/messages'
+            },
+            description: t('dashboard.routing.official'),
+            badge: t('dashboard.routing.official'),
+            badgeClass: 'official'
+        },
+        {
             provider: 'fenno',
             name: 'Fenno.ai',
             paths: {
@@ -393,6 +404,7 @@ async function copyCurlExample(provider, options = {}) {
             
         case 'atlascloud':
         case 'qiniu':
+        case 'apimart':
         case 'fenno':
         case 'openai-custom':
         case 'openai-qwen-oauth':
@@ -534,6 +546,7 @@ function renderRoutingExamples(providerConfigs) {
         'openai-custom': 'fa-comments',
         'atlascloud': 'fa-cloud',
         'qiniu': 'fa-cloud',
+        'apimart': 'fa-images',
         'fenno': 'fa-code',
         'claude-custom': 'fa-brain',
         'claude-kiro-oauth': 'fa-robot',
@@ -554,6 +567,7 @@ function renderRoutingExamples(providerConfigs) {
         'openai-custom': 'gpt-5.5',
         'atlascloud': 'gpt-5.5',
         'qiniu': 'gpt-5.5',
+        'apimart': 'gpt-5',
         'fenno': 'gpt-5.5',
         'openai-qwen-oauth': 'qwen3-coder-plus',
         'openai-iflow': 'qwen3-max',

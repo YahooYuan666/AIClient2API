@@ -576,6 +576,7 @@ export function getProtocolPrefix(provider) {
     // Special cases for OpenAI-compatible dedicated providers.
     if (provider === 'atlascloud' || provider.startsWith('atlascloud-') ||
         provider === 'qiniu' || provider.startsWith('qiniu-') ||
+        provider === 'apimart' || provider.startsWith('apimart-') ||
         provider === 'fenno' || provider.startsWith('fenno-') ||
         provider === 'github-copilot' || provider.startsWith('github-copilot-')) {
         return MODEL_PROTOCOL_PREFIX.OPENAI;
@@ -1186,7 +1187,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             const deltaType = chunk.delta?.type;
             if (deltaType === 'input_json_delta') {
                 const addressed = Number.isInteger(chunk.index) ? claudeStreamState.open.get(chunk.index) : null;
-                // A source index identifies a call only when that call actually claimed it.
+                // A source index identifies a call only while indexes are unique.
                 // Gemini repeats 0, so only its first call claims 0; later calls follow current.
                 const target = !claudeStreamState.indexesUnreliable
                     && addressed?.ownsSourceIndex

@@ -33,6 +33,23 @@
       "lastErrorTime": null
     }
   ],
+  "apimart": [
+    {
+      "customName": "APIMart节点1",
+      "OPENAI_API_KEY": "sk-apimart-key1",
+      "OPENAI_BASE_URL": "https://api.apimart.ai/v1",
+      "checkModelName": null,
+      "checkHealth": false,
+      "notSupportedModels": [],
+      "uuid": "6f579c65-d3c5-41b1-9985-9f6e3d7bf390",
+      "isHealthy": true,
+      "isDisabled": false,
+      "lastUsed": null,
+      "usageCount": 0,
+      "errorCount": 0,
+      "lastErrorTime": null
+    }
+  ],
   "fenno": [
     {
       "customName": "Fenno节点1",
