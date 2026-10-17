@@ -992,6 +992,13 @@ export class GeminiConverter extends BaseConverter {
                         }
                         thinkingBlock.signature = signature;
                     }
+                    // 上游 Vertex Claude 强校验历史 thinking 块的 signature；客户端把
+                    // 无签名的历史块原样回传会得到 400。没有真实签名时给空串并标记
+                    // unsigned，回传侧（ClaudeConverter）按此剔除。
+                    if (!thinkingBlock.signature) {
+                        thinkingBlock.signature = '';
+                        thinkingBlock.unsigned = true;
+                    }
                     content.push(thinkingBlock);
                 } else {
                     // 普通文本
