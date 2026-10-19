@@ -1196,13 +1196,16 @@ export class ProviderPoolManager {
     }
 
     async _acquireGreedyStickySlot(providerType, requestedModel, options) {
-        this.accountScheduler.noteUserRequest();
+        // reserve=false 只回答“还有没有别的号”，不占用并发槽、不排队、不改会话绑定。
+        const reserve = options?.probeOnly !== true;
+        if (reserve) this.accountScheduler.noteUserRequest();
         const accounts = this._greedyAccountView(providerType, requestedModel, options);
         const decision = await this.accountScheduler.acquire({
             uuid: options.stickyUuid,
             sessionId: options.sessionId,
             accounts,
-            family: quotaFamilyForModel(requestedModel)
+            family: quotaFamilyForModel(requestedModel),
+            reserve
         });
         if (decision.status === 'quota-exhausted') {
             const error = new Error(`Antigravity quota exhausted${decision.resetAt ? `; earliest reset ${decision.resetAt}` : ''}`);
@@ -1219,6 +1222,7 @@ export class ProviderPoolManager {
         }
         const selected = accounts.find(account => account.uuid === decision.uuid);
         if (!selected) return null;
+        if (!reserve) return selected.config;
         this.accountSchedulerHeld.add(`${providerType}:${decision.uuid}`);
         selected.config.lastUsed = new Date().toISOString();
         this._debouncedSave(providerType);

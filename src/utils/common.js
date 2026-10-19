@@ -329,8 +329,11 @@ function formatQuotaRecovery(recoveryTime) {
 
 async function hasAlternateAfterQuotaExhaustion(providerPoolManager, config, model, providerType, exhaustedUuids) {
     if (!providerPoolManager?.selectProviderWithFallback) return false;
+    // probeOnly：这是“问一句还有没有别的号”，不是真的要发请求。贪心调度下每次
+    // 探测都会 acquire 一个 inFlight 槽且从不释放，几次 429 之后账号被判定满员。
     const selected = await providerPoolManager.selectProviderWithFallback(providerType, model, {
         skipUsageCount: true,
+        probeOnly: true,
         excludeUuids: exhaustedUuids
     });
     return Boolean(selected?.config?.uuid && !exhaustedUuids.includes(selected.config.uuid));

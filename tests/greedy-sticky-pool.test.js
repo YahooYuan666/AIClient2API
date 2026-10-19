@@ -175,3 +175,53 @@ describe('optional greedy sticky pool selection', () => {
         expect(selected.uuid).toBe('low');
     });
 });
+
+describe('greedy sticky retry after quota exhaustion', () => {
+    test('a sticky uuid excluded by the caller is not selected again', async () => {
+        // 复现线上事故：账号 high 刚 429，换号重试时传 stickyUuid=high 且
+        // excludeUuids=[high]。旧实现会再次返回 high，manager 在候选集里
+        // find 不到它，于是上层报 "No healthy provider found"。
+        const manager = pool('greedy-sticky');
+        const first = await manager.acquireSlot('openai-custom', null, { sessionId: 'conversation' });
+        expect(first.uuid).toBe('high');
+
+        const retry = await manager.acquireSlot('openai-custom', null, {
+            sessionId: 'conversation',
+            stickyUuid: first.uuid,
+            excludeUuids: [first.uuid]
+        });
+        expect(retry).not.toBeNull();
+        expect(retry.uuid).not.toBe(first.uuid);
+        expect(retry.uuid).toBe('low');
+    });
+
+    test('a probe does not reserve a slot and can be repeated', async () => {
+        // 复现槽位泄漏：probeOnly 探测若真的 acquire，每次都会漏一个 inFlight，
+        // 三次之后账号被判定满员，池子就“没有健康账号”了。
+        const manager = pool('greedy-sticky');
+        for (let i = 0; i < 5; i += 1) {
+            const probed = await manager.selectProviderWithFallback('openai-custom', null, {
+                skipUsageCount: true,
+                probeOnly: true
+            });
+            expect(probed).not.toBeNull();
+            expect(probed.config.uuid).toBe('high');
+        }
+        const scheduler = manager.accountScheduler;
+        expect(scheduler.inFlight.get('high') || 0).toBe(0);
+    });
+
+    test('a probe reports exhaustion when every account is out', async () => {
+        const manager = pool('greedy-sticky');
+        // 关闭自动恢复，确保两个号在探测时确实不可用
+        manager._checkAndRecoverScheduledProviders = () => {};
+        manager.markProviderUnhealthyImmediately('openai-custom', { uuid: 'high' }, 'quota exhausted');
+        manager.markProviderUnhealthyImmediately('openai-custom', { uuid: 'low' }, 'quota exhausted');
+        // 没有候选时按额度耗尽抛出 429，上层据此直接返回而不是空转重试
+        await expect(manager.selectProviderWithFallback('openai-custom', null, {
+            skipUsageCount: true,
+            probeOnly: true
+        })).rejects.toMatchObject({ status: 429, quotaExhausted: true });
+        expect(manager.accountScheduler.inFlight.size).toBe(0);
+    });
+});

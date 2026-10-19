@@ -221,7 +221,12 @@ export class GreedyStickyScheduler {
         else this.refreshing.delete(uuid);
     }
 
-    async acquire({ uuid, sessionId, accounts, family }) {
+    /**
+     * @param {boolean} reserve - true：真正占用并发槽位；false：只探路，不占槽、不排队、
+     *   不改会话绑定。上层用 false 回答“还有没有别的号可用”，否则每次探测都会永久
+     *   泄漏一个 inFlight 计数，几个 429 之后账号就被判定为满员、再也选不中。
+     */
+    async acquire({ uuid, sessionId, accounts, family, reserve = true }) {
         const targetFamily = family || QUOTA_FAMILY_GEMINI;
         // 排序与判饱和都用当前请求族的视图：给本地副本打上族标记，
         // 不改调用方传入的对象（同一会话可能先后按不同族调用）。
@@ -232,12 +237,27 @@ export class GreedyStickyScheduler {
         // 换到 Claude）时旧绑定不适用，按目标族的榜单重新选号。
         let sticky = null;
         const requested = uuid || (sessionId ? this.sessions.get(sessionId) : null);
+        // 调用方用 excludeUuids 过滤过候选集：不在候选集里的账号本轮不可选，
+        // 即使它仍是粘性目标。刚 429 的账号就是这种情况——内部 accounts 表里
+        // 还留着它的额度记录，blocked() 拦不住它，于是它会被再次选中，随后
+        // manager 在候选集里 find 不到它而返回 null，上层报“没有健康账号”。
+        const requestedSelectable = Boolean(requested && familyAccounts.some(account => account.uuid === requested));
         const boundFamily = sessionId ? this.sessionFamilies.get(sessionId) : null;
         const familySwitched = Boolean(sessionId && boundFamily && boundFamily !== targetFamily);
-        if (requested && !familySwitched) {
+        if (requested && requestedSelectable && !familySwitched) {
             sticky = requested;
-        } else if (familySwitched && sessionId && this.sessions.get(sessionId) === requested) {
+        } else if ((familySwitched || !requestedSelectable) && sessionId && this.sessions.get(sessionId) === requested) {
             this.sessions.delete(sessionId);
+        }
+        if (!reserve) {
+            // 只探路：一次性判断有没有可选的号，不等待、不占用。
+            if (sticky && !this.blocked(sticky, targetFamily) && !this.refreshing.has(sticky)) {
+                return { status: 'acquired', uuid: sticky };
+            }
+            const probe = this.rankAvailable(familyAccounts)[0];
+            return probe
+                ? { status: 'acquired', uuid: probe.uuid }
+                : { status: 'quota-exhausted', resetAt: this.earliestReset(familyAccounts, targetFamily) };
         }
         while (this.now() - started <= this.queueTimeoutMs) {
             if (sticky && this.blocked(sticky, targetFamily)) {
