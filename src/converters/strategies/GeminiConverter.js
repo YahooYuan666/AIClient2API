@@ -4,9 +4,11 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
+import logger from '../../utils/logger.js';
 import { BaseConverter } from '../BaseConverter.js';
 import {
     checkAndAssignOrDefault,
+    hasUsableThinkingSignature,
     OPENAI_DEFAULT_MAX_TOKENS,
     OPENAI_DEFAULT_TEMPERATURE,
     OPENAI_DEFAULT_TOP_P,
@@ -992,12 +994,13 @@ export class GeminiConverter extends BaseConverter {
                         }
                         thinkingBlock.signature = signature;
                     }
-                    // 上游 Vertex Claude 强校验历史 thinking 块的 signature；客户端把
-                    // 无签名的历史块原样回传会得到 400。没有真实签名时给空串并标记
-                    // unsigned，回传侧（ClaudeConverter）按此剔除。
-                    if (!thinkingBlock.signature) {
-                        thinkingBlock.signature = '';
-                        thinkingBlock.unsigned = true;
+                    // 这里输出的是历史请求内容，会被送回上游。Vertex Claude 强校验
+                    // 历史 thinking 块的 signature：缺签名会 400 "thinking.signature:
+                    // Field required"，占位串则是 "Invalid signature"。唯一可行的做法是
+                    // 把没有真实签名的块整块丢掉，只保留正文。
+                    if (!hasUsableThinkingSignature(thinkingBlock.signature)) {
+                        logger.info('[GeminiConverter] Dropping historical thinking block without a usable signature.');
+                        return;
                     }
                     content.push(thinkingBlock);
                 } else {

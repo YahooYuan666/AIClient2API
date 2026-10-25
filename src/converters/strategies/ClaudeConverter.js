@@ -10,6 +10,8 @@ import {
     checkAndAssignOrDefault,
     cleanJsonSchemaForOpenAI,
     determineReasoningEffortFromBudget,
+    pickThinkingSignature,
+    describeSignature,
     GEMINI_DEFAULT_INPUT_TOKEN_LIMIT,
     GEMINI_DEFAULT_OUTPUT_TOKEN_LIMIT,
     OPENAI_DEFAULT_MAX_TOKENS,
@@ -952,23 +954,22 @@ export class ClaudeConverter extends BaseConverter {
                                 break;
                             
                             // 添加 thinking 块处理
-                            // 上游 Vertex Claude 强校验历史 thinking 块的 signature：
-                            // 缺签名（客户端只回传了思考文本）会 400 "thinking.signature: Field required"，
-                            // 补占位串也会 400 "Invalid signature"。唯一可行做法：
-                            // 没有有效签名的历史 thinking 块直接剔除，只保留正文。
+                            // 这是历史请求路径（内容会被送回上游）。上游 Vertex Claude 强校验
+                            // 历史 thinking 块的 signature：缺签名会 400 "thinking.signature:
+                            // Field required"，补占位串也会 400 "Invalid signature"。
+                            // 唯一可行做法：没有可用签名的块整块剔除，只保留正文。
                             case 'thinking':
                                 if (typeof block.thinking === 'string' && block.thinking.length > 0) {
-                                    const hasValidSignature = (block.signature && block.signature.length >= 50) || block.thoughtSignature;
-                                    if (!hasValidSignature) {
-                                        logger.info(`[ClaudeConverter] Dropping historical thinking block without a valid signature (len=${(block.signature || '').length}); upstream requires one.`);
+                                    const usableSignature = pickThinkingSignature(block);
+                                    if (!usableSignature) {
+                                        logger.info(`[ClaudeConverter] Dropping historical thinking block without a usable signature (signature=${describeSignature(block.signature)}, thoughtSignature=${describeSignature(block.thoughtSignature)}); upstream requires a real one.`);
                                         break;
                                     }
-                                    const thinkingPart = {
+                                    parts.push({
                                         text: block.thinking,
-                                        thought: true
-                                    };
-                                    thinkingPart.thoughtSignature = block.thoughtSignature || block.signature;
-                                    parts.push(thinkingPart);
+                                        thought: true,
+                                        thoughtSignature: usableSignature
+                                    });
                                 }
                                 break;
                             
@@ -1370,18 +1371,18 @@ export class ClaudeConverter extends BaseConverter {
                     break;
 
                 // 添加 thinking 块处理
-                // 同 toGeminiRequest：无有效签名的历史 thinking 块会被上游 400 拒收，直接剔除。
+                // 这是响应路径：内容回给客户端展示，不会被送去上游，因此不删除。
+                // 只决定要不要带签名——没有可用签名就省略该字段，上游的签名校验
+                // 只作用于请求方向，这里不做过滤。
                 case 'thinking':
                     if (block.thinking) {
-                        if (!block.signature || block.signature.length < 50) {
-                            logger.info(`[ClaudeConverter] toGeminiResponse: dropping thinking block without a valid signature.`);
-                            break;
-                        }
-                        parts.push({
+                        const thinkingPart = {
                             text: block.thinking,
-                            thought: true,
-                            thoughtSignature: block.signature
-                        });
+                            thought: true
+                        };
+                        const usableSignature = pickThinkingSignature(block);
+                        if (usableSignature) thinkingPart.thoughtSignature = usableSignature;
+                        parts.push(thinkingPart);
                     }
                     break;
 

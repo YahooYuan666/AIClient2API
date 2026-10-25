@@ -177,3 +177,42 @@ describe('upstream stream completion and truncation', () => {
         expect(manager.markProviderHealthy).not.toHaveBeenCalled();
     });
 });
+
+describe('the response-failure budget is driven by EMPTY_RESPONSE_MAX_RETRIES', () => {
+    const malformed = {
+        candidates: [{
+            finishReason: 'MALFORMED_FUNCTION_CALL',
+            finishMessage: 'Function call is empty - no input to parse.',
+            content: { role: 'model', parts: [{ text: '' }] }
+        }]
+    };
+
+    async function runWithBudget(budget) {
+        let calls = 0;
+        const service = {
+            calls: () => calls,
+            generateContentStream: jest.fn(() => {
+                calls += 1;
+                return (async function* () { yield malformed; })();
+            })
+        };
+        mockGetApiServiceWithFallback.mockImplementation(async () => ({
+            service,
+            uuid: 'only',
+            actualProviderType: 'gemini-antigravity',
+            actualModel: 'gemini-3.8-flash-high',
+            serviceConfig: {}
+        }));
+        await handleStreamRequest(
+            response(), service, 'gemini-3.8-flash-high', {}, 'claude', 'gemini-antigravity',
+            'none', null, pool(), 'only', null,
+            { CONFIG: { EMPTY_RESPONSE_MAX_RETRIES: budget, EMPTY_RESPONSE_RETRY_DELAY_MS: 1 }, maxRetries: 0 }
+        );
+        return calls;
+    }
+
+    // 内层重试和外层递归共用一个预算：总调用数必须是 1 + 配置值，不能相乘。
+    test.each([0, 1, 2, 4])('EMPTY_RESPONSE_MAX_RETRIES=%i makes exactly 1+N upstream calls', async budget => {
+        expect(await runWithBudget(budget)).toBe(1 + budget);
+    });
+});

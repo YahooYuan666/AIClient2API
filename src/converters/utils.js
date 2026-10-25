@@ -54,6 +54,47 @@ export const OPENAI_RESPONSES_DEFAULT_OUTPUT_TOKEN_LIMIT = 128000;
 // =============================================================================
 
 /**
+ * Vertex Claude 对历史 thinking 块的签名有最低长度要求：短于此值的串会被判为
+ * "Invalid signature"，缺字段则是 "thinking.signature: Field required"。
+ */
+export const MIN_VALID_THOUGHT_SIGNATURE_LENGTH = 50;
+
+/**
+ * 判断一个 thinking 块的签名能否原样回传给上游。
+ * 只接受字符串且长度达到下限；非字符串（对象、数字）与空串一律视为无效，
+ * 避免 truthy 判断放行一个上游本来就会拒收的值。
+ * @param {*} signature - 待检查的签名字段
+ * @returns {boolean}
+ */
+export function hasUsableThinkingSignature(signature) {
+    return typeof signature === 'string' && signature.length >= MIN_VALID_THOUGHT_SIGNATURE_LENGTH;
+}
+
+/**
+ * 在 block.signature 与 block.thoughtSignature 之间取一个可用签名。
+ * signature 优先；它无效时退回 thoughtSignature，两者都不合格则返回 null。
+ * @param {object} block - 含 signature / thoughtSignature 字段的块
+ * @returns {string|null}
+ */
+export function pickThinkingSignature(block) {
+    if (hasUsableThinkingSignature(block?.signature)) return block.signature;
+    if (hasUsableThinkingSignature(block?.thoughtSignature)) return block.thoughtSignature;
+    return null;
+}
+
+/**
+ * 把签名字段缩成一句可放进日志的描述，避免整串签名淹没日志。
+ * @param {*} signature - 待描述的签名字段
+ * @returns {string}
+ */
+export function describeSignature(signature) {
+    if (signature === undefined || signature === null) return 'absent';
+    if (typeof signature !== 'string') return `non-string(${typeof signature})`;
+    if (signature.length === 0) return 'empty';
+    return `len=${signature.length}`;
+}
+
+/**
  * 判断值是否为 undefined 或 0，并返回默认值
  * @param {*} value - 要检查的值
  * @param {*} defaultValue - 默认值
