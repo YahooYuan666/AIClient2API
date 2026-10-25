@@ -1251,7 +1251,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
         // 还没向客户端写出内容时，同一个请求可以再要一次。
         // 已经写出一半后不能把整段请求重放并拼接：工具参数会变成非法 JSON，文本也会重复前缀。
-        const MID_STREAM_RETRY_MAX = 2;
+        // 预算只有一个来源：EMPTY_RESPONSE_MAX_RETRIES。内层重试和外层递归共用
+        // responseFailureAttempts 这一个累计计数，避免两层各自计数相乘。
+        const responseFailureBudget = Math.max(0, Number(CONFIG?.EMPTY_RESPONSE_MAX_RETRIES ?? 2) || 0);
         let midStreamRetryCount = 0;
 
         while (true) {
@@ -1285,11 +1287,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             } catch (classificationError) {
                 streamAttemptFinished = false;
                 // 客户端还没收到内容时，同请求再要一次。已经收到内容后必须明确失败。
+                // 判断的是「本次累计已用掉多少预算」，两层共用一个计数器。
                 if (
                     classificationError.isRetryableUpstreamResponseFailure
                     && !anyDataSent
                     && !clientDisconnected.value
-                    && midStreamRetryCount < MID_STREAM_RETRY_MAX
+                    && responseFailureAttempts < responseFailureBudget
                 ) {
                     retrySignal = classificationError;
                     break;
@@ -1430,9 +1433,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         sawUpstreamFinish = streamAttemptFinished;
         streamAttemptFinished = false;
         // 本次尝试没有原生终止信号。客户端还没收到内容时可以再要一次；
-        // 已经收到内容，或者重试次数用完，都按截断失败返回，不能补一个成功结束。
+        // 已经收到内容，或者预算用完，都按截断失败返回，不能补一个成功结束。
         if (!retrySignal && !sawUpstreamFinish && !clientDisconnected.value
-            && !anyDataSent && midStreamRetryCount < MID_STREAM_RETRY_MAX) {
+            && !anyDataSent && responseFailureAttempts < responseFailureBudget) {
             retrySignal = {
                 isRetryableUpstreamResponseFailure: true,
                 responseFailureCode: 'TRUNCATED_STREAM',
@@ -1450,7 +1453,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
         midStreamRetryCount += 1;
         responseFailureAttempts += 1;
-        logger.warn(`[Stream Retry] ${retrySignal.responseFailureCode || retrySignal.responseFailureLabel || 'retryable failure'} after data already sent to client. Retrying the same upstream request invisibly (${midStreamRetryCount}/${MID_STREAM_RETRY_MAX})...`);
+        logger.warn(`[Stream Retry] ${retrySignal.responseFailureCode || retrySignal.responseFailureLabel || 'retryable failure'} after data already sent to client. Retrying the same upstream request invisibly (${responseFailureAttempts}/${responseFailureBudget} of the shared response-failure budget)...`);
         const retryDelayMs = CONFIG?.EMPTY_RESPONSE_RETRY_DELAY_MS ?? 500;
         if (retryDelayMs > 0) {
             await new Promise(resolve => setTimeout(resolve, retryDelayMs));
