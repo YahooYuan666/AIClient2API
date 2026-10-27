@@ -91,6 +91,28 @@ describe('upstream stream completion and truncation', () => {
         expect(manager.markProviderHealthy).not.toHaveBeenCalled();
     });
 
+    test('thinking before an empty function call stays unsent so the request can be retried', async () => {
+        const thinking = { candidates: [{ content: { role: 'model', parts: [{ thought: true, text: 'Checking the script.' }] } }] };
+        const malformed = { candidates: [{ content: { role: 'model', parts: [{ thoughtSignature: 'sig', text: '' }] }, finishReason: 'MALFORMED_FUNCTION_CALL', finishMessage: 'Function call is empty - no input to parse.' }] };
+        const success = { candidates: [{ content: { role: 'model', parts: [{ text: 'done' }] }, finishReason: 'STOP' }] };
+        const service = serviceWith([[thinking, malformed], [success]]);
+        const res = response();
+        const writesBeforeRetry = [];
+        res.write.mockImplementation(value => {
+            if (service.calls() < 2) writesBeforeRetry.push(String(value));
+        });
+        const manager = pool();
+        await handleStreamRequest(
+            res, service, 'gemini-3.8-flash-high', {}, 'claude', 'gemini-antigravity',
+            'none', null, manager, 'only', null,
+            { CONFIG: { EMPTY_RESPONSE_RETRY_DELAY_MS: 1 }, maxRetries: 0 }
+        );
+        const body = res.write.mock.calls.flat().join('');
+        expect(service.calls()).toBe(2);
+        expect(writesBeforeRetry.join('')).not.toContain('Checking the script.');
+        expect(body).toContain('done');
+    });
+
     test('an EOF after a malformed finish is a truncation, not a success', async () => {
         const malformed = { candidates: [{ finishReason: 'MALFORMED_FUNCTION_CALL', content: { role: 'model', parts: [{ text: 'partial' }] } }] };
         const service = serviceWith([
