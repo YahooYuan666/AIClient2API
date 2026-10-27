@@ -478,6 +478,8 @@ In the Web UI management interface, you can complete authorization configuration
 2. **Pro Member**: Antigravity is temporarily open to Pro members, you need to purchase a Pro membership first.
 3. **Organization Account**: Organization accounts require separate authorization, contact the administrator to obtain authorization.
 
+For free-tier model listings, legacy alias compatibility, and differences from upstream documentation, see the [Antigravity free-tier model policy](docs/ANTIGRAVITY_FREE_TIER_MODELS.md).
+
 #### Kiro API Configuration
 1. **Environment Preparation**: [Download and install Kiro client](https://kiro.dev/pricing/)
 2. **Complete Authorization**: Log in to your account in the client to generate `kiro-auth-token.json` credential file

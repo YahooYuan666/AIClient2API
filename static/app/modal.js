@@ -4,6 +4,7 @@ import { escapeHtml, showToast, getFieldLabel, getProviderTypeFields } from './u
 import { handleProviderPasswordToggle } from './event-handlers.js';
 import { t } from './i18n.js';
 import { createCodexQuotaBadgeLoader } from './codex-quota-badges.js';
+import { formatModelLabel } from './model-labels.js';
 
 const MANAGED_MODEL_LIST_PROVIDERS = new Set(['openai-custom', 'openaiResponses-custom', 'claude-custom', 'atlascloud', 'qiniu', 'apimart', 'fenno']);
 const COPILOT_QUOTA_CACHE_TTL_MS = 60_000;
@@ -162,6 +163,7 @@ function collectDraftProviderConfig(providerDetail, providerType, uuid) {
     return providerConfig;
 }
 let cachedModels = []; // 缓存模型列表
+let cachedModelStatus = {};
 
 function closeSupportedModelsPicker(overlay) {
     if (!overlay) return;
@@ -399,6 +401,7 @@ function showProviderManagerModal(data, initialSearchTerm = '') {
     currentPage = 1;
     nodeSearchTerm = initialSearchTerm;
     cachedModels = [];
+    cachedModelStatus = {};
     
     // 移除已存在的模态框
     const existingModal = document.querySelector('.provider-modal');
@@ -759,11 +762,12 @@ async function loadModelsForProviderType(providerType, providers) {
         }
         
         // 只调用一次API获取模型列表
-        const response = await window.apiClient.get(`/provider-models/${encodeURIComponent(providerType)}`);
+        const response = await window.apiClient.get(`/provider-models/${encodeURIComponent(providerType)}?includeUnavailable=true`);
         const models = response.models || [];
         
         // 缓存模型列表
         cachedModels = models;
+        cachedModelStatus = response.modelStatus || {};
         
         // 为每个提供商渲染模型选择器
         providers.forEach(provider => {
@@ -2278,11 +2282,11 @@ function renderNotSupportedModelsSelector(uuid, models, notSupportedModels = [])
             <label class="model-checkbox-label">
                 <input type="checkbox"
                        class="model-checkbox"
-                       value="${model}"
+                       value="${escapeHtml(model)}"
                        data-uuid="${uuid}"
                        ${isChecked ? 'checked' : ''}
                        disabled>
-                <span class="model-name">${model}</span>
+                <span class="model-name">${escapeHtml(formatModelLabel(model, cachedModelStatus[model]))}</span>
             </label>
         `;
     });

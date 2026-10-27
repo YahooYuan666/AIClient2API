@@ -346,6 +346,7 @@ export class CustomModelsManager {
             }
             this.closeModal('customModelModal');
             await this.load();
+            await window.refreshModels?.();
         } catch (e) { alert(e.message); }
     }
 
@@ -354,6 +355,7 @@ export class CustomModelsManager {
         try {
             await window.apiClient.delete(`/custom-models/${encodeURIComponent(id)}`);
             await this.load();
+            await window.refreshModels?.();
         } catch (e) { alert(e.message); }
     }
 }

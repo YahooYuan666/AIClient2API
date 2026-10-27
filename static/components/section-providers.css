@@ -1377,8 +1377,9 @@
     }
 }
 
-/* 授权按钮样式 */
-.generate-auth-btn {
+/* 授权及添加 PAT 按钮样式 */
+.generate-auth-btn,
+.add-github-copilot-pat-btn {
     display: inline-flex;
     align-items: center;
     gap: 0.5rem;
@@ -1393,7 +1394,8 @@
     transition: var(--transition);
 }
 
-.generate-auth-btn:hover {
+.generate-auth-btn:hover,
+.add-github-copilot-pat-btn:hover {
     background: var(--info-hover);
     color: var(--info-text-darker);
     transform: translateY(-1px);

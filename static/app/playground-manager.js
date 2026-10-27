@@ -3,8 +3,10 @@
 import { getAuthHeaders } from './auth.js';
 import { markOnce, getProviderConfigs } from './utils.js';
 import { t } from './i18n.js';
+import { formatModelLabel } from './model-labels.js';
 
 let providerModels = {};   // { providerType: [model1, model2, ...] }
+let modelStatus = {};
 let apiKey = '';           // REQUIRED_API_KEY, used for /v1/chat/completions auth
 let messages = [];         // current conversation history
 let pendingFiles = [];     // { name, type, dataUrl }
@@ -49,7 +51,7 @@ async function loadProviderData() {
 
         const [accessRes, modelsRes] = await Promise.all([
             fetch('/api/access-info', { headers }),
-            fetch('/api/provider-models', { headers })
+            fetch('/api/provider-models?includeUnavailable=true', { headers })
         ]);
 
         if (accessRes.ok) {
@@ -59,7 +61,9 @@ async function loadProviderData() {
         }
 
         if (modelsRes.ok) {
-            providerModels = await modelsRes.json();
+            const response = await modelsRes.json();
+            modelStatus = response.modelStatus || {};
+            providerModels = response.modelStatus ? response.models : response;
         }
 
         // 尝试恢复上次选择的提供商和模型
@@ -236,7 +240,7 @@ function onProviderChange(providerType) {
     models.forEach(m => {
         const opt = document.createElement('option');
         opt.value = m;
-        opt.textContent = m;
+        opt.textContent = formatModelLabel(m, modelStatus[providerType]?.[m]);
         modelSel.appendChild(opt);
     });
     modelSel.disabled = false;

@@ -5,9 +5,11 @@
 
 import { t } from './i18n.js';
 import { apiClient } from './auth.js';
+import { formatModelLabel } from './model-labels.js';
 
 // 模型数据缓存
 let modelsCache = null;
+let modelStatus = {};
 
 // 提供商配置缓存
 let currentProviderConfigs = null;
@@ -34,7 +36,9 @@ async function fetchProviderModels() {
     }
     
     try {
-        modelsCache = await apiClient.get('/provider-models');
+        const response = await apiClient.get('/provider-models?includeUnavailable=true');
+        modelStatus = response.modelStatus || {};
+        modelsCache = response.modelStatus ? response.models : response;
         return modelsCache;
     } catch (error) {
         console.error('[Models Manager] Failed to fetch provider models:', error);
@@ -153,7 +157,7 @@ function renderModelsList(models) {
                             <div class="model-item-icon">
                                 <i class="fas fa-cube"></i>
                             </div>
-                            <span class="model-item-name">${escapeHtml(model)}</span>
+                            <span class="model-item-name">${escapeHtml(formatModelLabel(model, modelStatus[providerType]?.[model]))}</span>
                             <div class="model-item-copy">
                                 <i class="fas fa-copy"></i>
                             </div>
@@ -324,6 +328,7 @@ async function initModelsManager() {
  */
 async function refreshModels() {
     modelsCache = null;
+    modelStatus = {};
     await initModelsManager();
 }
 

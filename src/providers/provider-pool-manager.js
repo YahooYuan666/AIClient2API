@@ -7,6 +7,8 @@ import { convertData } from '../convert/convert.js';
 
 import {
     getConfiguredSupportedModels,
+    getCustomModelActualProvider,
+    customModelMatchesProvider,
     getCustomModelListProvider,
     getProviderModels,
     normalizeModelIds
@@ -880,6 +882,8 @@ export class ProviderPoolManager {
                     providerConfig.lastErrorMessage = providerConfig.lastErrorMessage || null;
                     providerConfig.customName = providerConfig.customName || null;
 
+                    this._migrateLegacyAntigravityQuotaCooldown(providerType, providerConfig);
+
                     this.providerStatus[providerType].push({
                         config: providerConfig,
                         uuid: providerConfig.uuid, // Still keep uuid at the top level for easy access
@@ -1059,6 +1063,14 @@ export class ProviderPoolManager {
         let availableAndHealthyProviders = availableProviders.filter(p =>
             p.config.isHealthy && !p.config.isDisabled && !p.config.needsRefresh && !excludedUuids.has(p.config.uuid)
         );
+
+        // Antigravity has independent quota books for Gemini and third-party (Claude/GPT)
+        // models. A Gemini quota exhaustion must not hide the account from Claude requests.
+        if (providerType === MODEL_PROVIDER.ANTIGRAVITY && requestedModel) {
+            availableAndHealthyProviders = availableAndHealthyProviders.filter(provider =>
+                !this._isAntigravityQuotaFamilyExhausted(provider.config, requestedModel, now)
+            );
+        }
 
         // 如果指定了模型，则排除不支持该模型的提供商
         if (requestedModel) {
@@ -1656,9 +1668,10 @@ export class ProviderPoolManager {
     /**
      * Gets all available models across all provider pools, with optional format conversion.
      * @param {string} [endpointType] - Optional endpoint type for format conversion (OPENAI_MODEL_LIST or GEMINI_MODEL_LIST).
+     * @param {{ includeUnavailable?: boolean }} options Include the full UI catalog with discovery status.
      * @returns {Promise<Object|Array>} Formatted model list or raw array of model objects.
      */
-    async getAllAvailableModels(endpointType = null) {
+    async getAllAvailableModels(endpointType = null, { includeUnavailable = false } = {}) {
         const allModels = [];
         
         // 获取所有已注册的提供商和号池中的提供商
@@ -1669,6 +1682,7 @@ export class ProviderPoolManager {
             if (this.providerStatus[providerType]) {
                 const customAliases = getCustomModelAliasesForProvider(this.globalConfig, providerType);
                 const customModelIds = getCustomModelIdsForProvider(this.globalConfig, providerType);
+                const modelAvailability = new Map();
                 const configuredSupportedModels = normalizeModelIds(
                     this.providerStatus[providerType].flatMap(providerStatus =>
                         getConfiguredSupportedModels(providerType, providerStatus.config)
@@ -1682,13 +1696,17 @@ export class ProviderPoolManager {
                     ]);
 
                 if (providerType === MODEL_PROVIDER.ANTIGRAVITY && this.providerStatus[providerType].length > 0) {
-                    const { isAntigravityModelRetired } = await import('./gemini/antigravity-core.js');
-                    const currentTime = Date.now();
-                    if (models.some(model => isAntigravityModelRetired(model, currentTime, 'free-tier'))) {
+                    const {
+                        isAntigravityModelListed,
+                        isAntigravityModelRetired,
+                        resolveAntigravityUpstreamModel
+                    } = await import('./gemini/antigravity-core.js');
+                    if (includeUnavailable || models.some(model => !isAntigravityModelListed(model, 'free-tier'))) {
                         const accountAvailability = [];
                         for (const providerStatus of this.providerStatus[providerType]) {
                             let tierId;
                             let accountModelIds = null;
+                            let discoverySource = 'unknown';
                             try {
                                 const tempConfig = {
                                     ...this.globalConfig,
@@ -1704,6 +1722,7 @@ export class ProviderPoolManager {
                                             accountModelIds = new Set(nativeModelList.models
                                                 .map(model => model.name?.replace(/^models\//, ''))
                                                 .filter(Boolean));
+                                            discoverySource = serviceAdapter.antigravityApiService?.availableModelsSource || 'upstream';
                                         }
                                     } catch (err) {
                                         this._log('debug', `Failed to load Antigravity account tier for ${providerStatus.uuid}: ${err.message}`);
@@ -1713,17 +1732,51 @@ export class ProviderPoolManager {
                             } catch (err) {
                                 this._log('debug', `Failed to inspect Antigravity account tier for ${providerStatus.uuid}: ${err.message}`);
                             }
-                            accountAvailability.push({ tierId, modelIds: accountModelIds });
+                            accountAvailability.push({
+                                tierId,
+                                modelIds: accountModelIds,
+                                upstreamModelIds: accountModelIds
+                                    ? new Set([...accountModelIds].map(resolveAntigravityUpstreamModel))
+                                    : null,
+                                discoverySource
+                            });
                         }
 
-                        models = models.filter(model => {
-                            if (!isAntigravityModelRetired(model, currentTime, 'free-tier')) return true;
-                            return accountAvailability.some(({ tierId, modelIds }) => {
-                                if (!tierId) return true;
-                                if (isAntigravityModelRetired(model, currentTime, tierId)) return false;
-                                return !modelIds || modelIds.has(model);
+                        if (includeUnavailable) {
+                            const customModels = (Array.isArray(this.globalConfig.customModels) ? this.globalConfig.customModels : [])
+                                .filter(model => customModelMatchesProvider(model, providerType));
+                            for (const model of models) {
+                                const customModel = customModels.find(config => config.id?.trim() === model);
+                                const actualProvider = getCustomModelActualProvider(customModel) || providerType;
+                                if (actualProvider !== providerType) {
+                                    modelAvailability.set(model, 'unknown');
+                                    continue;
+                                }
+                                const actualModel = customModel?.actualModel || model;
+                                const upstreamModel = resolveAntigravityUpstreamModel(actualModel);
+                                const eligibleAccounts = accountAvailability.filter(account =>
+                                    !isAntigravityModelRetired(actualModel, Date.now(), account.tierId));
+                                const status = eligibleAccounts.length === 0 ? 'tier_restricted'
+                                    : eligibleAccounts.some(account => account.discoverySource === 'upstream' &&
+                                        account.upstreamModelIds?.has(upstreamModel)) ? 'returned'
+                                    : eligibleAccounts.some(account => account.discoverySource !== 'upstream') ? 'unknown'
+                                    : 'not_returned';
+                                modelAvailability.set(model, status);
+                            }
+                        } else {
+                            const explicitCustomModels = new Set(normalizeModelIds(customModelIds));
+                            models = models.filter(model => {
+                                // Manual registrations are list entries, not discovery results.
+                                // Keep them visible; actual routing still enforces account permissions.
+                                if (explicitCustomModels.has(model)) return true;
+                                if (isAntigravityModelListed(model, 'free-tier')) return true;
+                                return accountAvailability.some(({ tierId, modelIds }) => {
+                                    if (!tierId) return true;
+                                    if (!isAntigravityModelListed(model, tierId)) return false;
+                                    return !modelIds || modelIds.has(model);
+                                });
                             });
-                        });
+                        }
                     }
                 }
 
@@ -1774,7 +1827,10 @@ export class ProviderPoolManager {
                     allModels.push({
                         id: `${providerType}:${model}`,
                         provider: providerType,
-                        model: model
+                        model: model,
+                        ...(includeUnavailable && providerType === MODEL_PROVIDER.ANTIGRAVITY
+                            ? { availability: modelAvailability.get(model) || 'unknown' }
+                            : {})
                     });
                 }
             }
@@ -1956,6 +2012,79 @@ export class ProviderPoolManager {
            
             this._debouncedSave(providerType);
         }
+    }
+
+    /**
+     * Returns true when the requested Antigravity quota family is still cooling down.
+     * Gemini and third-party (Claude/GPT) quota books are independent.
+     * @private
+     */
+    _isAntigravityQuotaFamilyExhausted(providerConfig, model, now = Date.now()) {
+        const exhaustedByFamily = providerConfig?.quotaExhaustionByFamily;
+        if (!exhaustedByFamily || typeof exhaustedByFamily !== 'object') return false;
+        const recoveryAt = Date.parse(exhaustedByFamily[quotaFamilyForModel(model)] || '');
+        return Number.isFinite(recoveryAt) && recoveryAt > now;
+    }
+
+    /**
+     * Older versions quarantined the whole Antigravity account when one quota family
+     * was exhausted. Convert that persisted legacy state to the family-scoped model.
+     * The next real 429 will quarantine only the exhausted family.
+     * @private
+     */
+    _migrateLegacyAntigravityQuotaCooldown(providerType, config) {
+        if (providerType !== MODEL_PROVIDER.ANTIGRAVITY || !config || config.isHealthy ||
+            !config.scheduledRecoveryTime || config.quotaExhaustionByFamily ||
+            !/quota|RESOURCE_EXHAUSTED/i.test(String(config.lastErrorMessage || ''))) {
+            return false;
+        }
+
+        this._log('info', `Migrating legacy Antigravity account-wide quota cooldown for ${this._getDisplayName(config)} to family-scoped quota tracking`);
+        config.isHealthy = true;
+        config.errorCount = 0;
+        config.lastErrorTime = null;
+        config.lastErrorMessage = null;
+        config.scheduledRecoveryTime = null;
+        return true;
+    }
+
+    /**
+     * Records quota exhaustion for one Antigravity model family without marking the
+     * whole account unhealthy. The account stays usable for the other family.
+     * @param {string} providerType - The provider type.
+     * @param {object} providerConfig - The provider config containing the uuid.
+     * @param {object} options - Model or family plus recovery time and optional message.
+     * @returns {boolean} True when the family cooldown was recorded.
+     */
+    markAntigravityQuotaExhausted(providerType, providerConfig, options = {}) {
+        if (!providerConfig?.uuid) {
+            this._log('error', 'Invalid providerConfig in markAntigravityQuotaExhausted');
+            return false;
+        }
+
+        const recoveryDate = options.recoveryTime instanceof Date
+            ? options.recoveryTime
+            : new Date(options.recoveryTime);
+        if (Number.isNaN(recoveryDate.getTime())) return false;
+
+        const provider = this._findProvider(providerType, providerConfig.uuid);
+        if (!provider) return false;
+
+        const family = options.family || quotaFamilyForModel(options.model);
+        const exhaustedByFamily = provider.config.quotaExhaustionByFamily &&
+            typeof provider.config.quotaExhaustionByFamily === 'object'
+            ? { ...provider.config.quotaExhaustionByFamily }
+            : {};
+        exhaustedByFamily[family] = recoveryDate.toISOString();
+        provider.config.quotaExhaustionByFamily = exhaustedByFamily;
+        provider.config.lastErrorTime = new Date().toISOString();
+        if (options.errorMessage) {
+            provider.config.lastErrorMessage = options.errorMessage;
+        }
+
+        this._log('warn', `Marked ${this._getDisplayName(provider.config)} (${providerType}) ${family} quota exhausted until ${recoveryDate.toISOString()}; other quota families remain available.`);
+        this._debouncedSave(providerType);
+        return true;
     }
 
     /**
@@ -2264,6 +2393,13 @@ export class ProviderPoolManager {
             for (const providerStatus of providers) {
                 const config = providerStatus.config;
                 
+                // 兼容旧版本：Antigravity 旧逻辑会因单一配额组耗尽把整个账号
+                // 标记为不健康。现在改为按家族冷却，因此把这种遗留的全局配额
+                // 冷却迁移为健康状态；下一次真实 429 会只冷却对应家族。
+                if (this._migrateLegacyAntigravityQuotaCooldown(type, config)) {
+                    this._debouncedSave(type);
+                }
+
                 // 检查是否有 scheduledRecoveryTime 且已到恢复时间
                 if (config.scheduledRecoveryTime && !config.isHealthy) {
                     const recoveryTime = new Date(config.scheduledRecoveryTime);
@@ -2278,6 +2414,26 @@ export class ProviderPoolManager {
                         config.scheduledRecoveryTime = null; // 清除恢复时间
                         
                         // 保存更改
+                        this._debouncedSave(type);
+                    }
+                }
+
+                // 清理已到期的 Antigravity 分家族配额冷却
+                if (config.quotaExhaustionByFamily && typeof config.quotaExhaustionByFamily === 'object') {
+                    let changed = false;
+                    for (const [family, recoveryAt] of Object.entries(config.quotaExhaustionByFamily)) {
+                        const recoveryTime = Date.parse(recoveryAt);
+                        if (!Number.isFinite(recoveryTime) || now.getTime() >= recoveryTime) {
+                            delete config.quotaExhaustionByFamily[family];
+                            changed = true;
+                        }
+                    }
+                    if (Object.keys(config.quotaExhaustionByFamily).length === 0) {
+                        config.quotaExhaustionByFamily = null;
+                        changed = true;
+                    }
+                    if (changed) {
+                        this._log('info', `Cleared expired Antigravity quota cooldowns for ${this._getDisplayName(config)} (${type})`);
                         this._debouncedSave(type);
                     }
                 }

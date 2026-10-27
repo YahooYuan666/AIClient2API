@@ -121,6 +121,27 @@ function getManagedSupportedModels(providerType, providers = []) {
     );
 }
 
+function wantsFullModelCatalog(req) {
+    return new URL(req.url || '/', 'http://localhost').searchParams.get('includeUnavailable') === 'true';
+}
+
+async function getTierAwareAntigravityModels(providerPoolManager, includeUnavailable = false) {
+    const providerType = 'gemini-antigravity';
+    if (!providerPoolManager?.providerStatus?.[providerType]?.length ||
+        typeof providerPoolManager.getAllAvailableModels !== 'function') {
+        return null;
+    }
+
+    const availableModels = includeUnavailable
+        ? await providerPoolManager.getAllAvailableModels(null, { includeUnavailable: true })
+        : await providerPoolManager.getAllAvailableModels();
+    const entries = availableModels.filter(model => model.provider === providerType);
+    return {
+        models: normalizeModelIds(entries.map(model => model.model)),
+        modelStatus: Object.fromEntries(entries.map(model => [model.model, model.availability || 'unknown']))
+    };
+}
+
 async function persistProviderStatusToFile(currentConfig, providerPoolManager) {
     const filePath = currentConfig.PROVIDER_POOLS_FILE_PATH || 'configs/provider_pools.json';
     const providerPools = {};
@@ -339,9 +360,47 @@ export function normalizeCodexQuota(usage = {}) {
     };
 }
 
+function normalizeAntigravityQuota(usage = {}) {
+    const familyUsage = { gemini: [], claude: [] };
+    const getFamily = (...names) => {
+        const value = names.filter(Boolean).join(' ').toLowerCase();
+        if (/claude|anthropic|gpt/.test(value)) return 'claude';
+        if (value.includes('gemini')) return 'gemini';
+        return null;
+    };
+    const addBucket = (bucket, familyHint = null) => {
+        if (!bucket || typeof bucket !== 'object') return;
+        const family = familyHint || getFamily(bucket.bucketId, bucket.modelId, bucket.name, bucket.displayName);
+        const remaining = Number(bucket.remainingFraction ?? bucket.remaining_fraction ?? bucket.remaining);
+        if (!family || !Number.isFinite(remaining) || remaining < 0 || remaining > 1) return;
+        familyUsage[family].push(remaining);
+    };
+    const visit = (value, key = '', familyHint = null) => {
+        if (!value || typeof value !== 'object') return;
+        const family = familyHint || getFamily(key, value.modelId, value.bucketId, value.name, value.displayName);
+        if (Array.isArray(value)) {
+            value.forEach(item => visit(item, key, family));
+            return;
+        }
+        if (value.remainingFraction !== undefined || value.remaining_fraction !== undefined || value.remaining !== undefined) {
+            addBucket(value, family);
+        }
+        Object.entries(value).forEach(([childKey, child]) => {
+            if (child && typeof child === 'object') visit(child, childKey, family);
+        });
+    };
+
+    const source = usage?.groups || usage?.buckets || usage?.models || usage;
+    visit(source);
+    return Object.fromEntries(Object.entries(familyUsage).map(([family, values]) => [family, {
+        available: values.length > 0,
+        usedPercentage: values.length > 0 ? Math.max(...values.map(value => Math.round((1 - value) * 100))) : null
+    }]));
+}
+
 /** Read provider quota for one account node. */
 export async function handleGetProviderQuota(req, res, currentConfig, providerPoolManager, providerType, providerUuid) {
-    if (!['github-copilot', 'openai-codex-oauth'].includes(providerType)) {
+    if (!['github-copilot', 'openai-codex-oauth', 'gemini-antigravity'].includes(providerType)) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: 'Quota lookup is not supported for this provider.' } }));
         return true;
@@ -365,7 +424,11 @@ export async function handleGetProviderQuota(req, res, currentConfig, providerPo
         delete serviceConfig.providerPools;
 
         const serviceAdapter = getServiceAdapter(serviceConfig);
-        const method = providerType === 'openai-codex-oauth' ? 'getUsageLimits' : 'getQuota';
+        const method = providerType === 'openai-codex-oauth'
+            ? 'getUsageLimits'
+            : providerType === 'gemini-antigravity'
+                ? 'getQuotaSummary'
+                : 'getQuota';
         if (typeof serviceAdapter[method] !== 'function') {
             res.writeHead(501, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: { message: 'Quota lookup is not supported by this adapter.' } }));
@@ -373,7 +436,11 @@ export async function handleGetProviderQuota(req, res, currentConfig, providerPo
         }
 
         const rawQuota = await serviceAdapter[method]();
-        const quota = providerType === 'openai-codex-oauth' ? normalizeCodexQuota(rawQuota) : rawQuota;
+        const quota = providerType === 'openai-codex-oauth'
+            ? normalizeCodexQuota(rawQuota)
+            : providerType === 'gemini-antigravity'
+                ? normalizeAntigravityQuota(rawQuota)
+                : rawQuota;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ providerType, providerUuid, quota }));
         return true;
@@ -416,6 +483,7 @@ export async function handleGetSupportedProviders(req, res, currentConfig, provi
  * 获取所有提供商的可用模型（支持动态配置组）
  */
 export async function handleGetProviderModels(req, res, currentConfig, providerPoolManager) {
+    const includeUnavailable = wantsFullModelCatalog(req);
     const registeredProviders = getRegisteredProviders();
     let providerPools = {};
 
@@ -429,9 +497,19 @@ export async function handleGetProviderModels(req, res, currentConfig, providerP
     const poolTypes = Object.keys(providerPools);
     const allTypes = [...new Set([...registeredProviders, ...poolTypes])];
     const allModels = {};
+    let antigravityModels = null;
+    try {
+        antigravityModels = await getTierAwareAntigravityModels(providerPoolManager, includeUnavailable);
+    } catch (error) {
+        logger.warn('[UI API] Failed to load tier-aware Antigravity models:', error.message);
+        antigravityModels = includeUnavailable ? null : { models: [] };
+    }
 
     allTypes.forEach(type => {
         let models = getProviderModels(type);
+        if (type === 'gemini-antigravity' && antigravityModels !== null) {
+            models = antigravityModels.models;
+        }
         if (usesManagedModelList(type)) {
             const managedModels = getManagedSupportedModels(type, providerPools[type] || []);
             if (managedModels.length > 0) {
@@ -444,7 +522,13 @@ export async function handleGetProviderModels(req, res, currentConfig, providerP
     });
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(allModels));
+    res.end(JSON.stringify(includeUnavailable ? {
+        models: allModels,
+        modelStatus: {
+            'gemini-antigravity': Object.fromEntries((allModels['gemini-antigravity'] || [])
+                .map(model => [model, antigravityModels?.modelStatus?.[model] || 'unknown']))
+        }
+    } : allModels));
     return true;
 }
 
@@ -452,8 +536,21 @@ export async function handleGetProviderModels(req, res, currentConfig, providerP
  * 获取特定提供商类型的可用模型
  */
 export async function handleGetProviderTypeModels(req, res, currentConfig, providerPoolManager, providerType) {
+    const includeUnavailable = wantsFullModelCatalog(req);
+    let modelStatus = {};
     let models = getProviderModels(providerType);
-    if (usesManagedModelList(providerType)) {
+    if (providerType === 'gemini-antigravity') {
+        try {
+            const antigravityModels = await getTierAwareAntigravityModels(providerPoolManager, includeUnavailable);
+            if (antigravityModels !== null) {
+                models = antigravityModels.models;
+                modelStatus = antigravityModels.modelStatus;
+            }
+        } catch (error) {
+            logger.warn('[UI API] Failed to load tier-aware Antigravity models:', error.message);
+            if (!includeUnavailable) models = [];
+        }
+    } else if (usesManagedModelList(providerType)) {
         try {
             const providerPools = loadProviderPools(currentConfig, providerPoolManager);
             const managedModels = getManagedSupportedModels(providerType, providerPools[providerType] || []);
@@ -467,7 +564,12 @@ export async function handleGetProviderTypeModels(req, res, currentConfig, provi
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
         providerType,
-        models
+        models,
+        ...(includeUnavailable ? {
+            modelStatus: providerType === 'gemini-antigravity'
+                ? Object.fromEntries(models.map(model => [model, modelStatus[model] || 'unknown']))
+                : {}
+        } : {})
     }));
     return true;
 }

@@ -73,6 +73,12 @@ function getBaseProviderConfigs() {
             defaultPath: 'configs/codex/'
         },
         {
+            id: 'github-copilot',
+            name: t('dashboard.routing.nodeName.githubCopilot'),
+            usageName: 'GitHub Copilot',
+            icon: 'fab fa-github'
+        },
+        {
             id: 'grok-cli-oauth',
             name: t('dashboard.routing.nodeName.grokCli'),
             usageName: 'Grok CLI',

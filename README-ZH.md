@@ -477,6 +477,8 @@ docker compose up -d
 2. **Pro会员**：Antigravity 暂时对 Pro 会员开放，需要先购买 Pro 会员。
 3. **组织账号**：组织账号需要单独授权，联系管理员获取授权。
 
+免费账号的模型展示、旧别名兼容及上游资料差异见 [Antigravity 免费账号模型策略](docs/ANTIGRAVITY_FREE_TIER_MODELS.md)。
+
 #### Kiro API 配置
 1. **环境准备**：[下载并安装 Kiro 客户端](https://kiro.dev/pricing/)
 2. **完成授权**：在客户端中登录账号，生成 `kiro-auth-token.json` 凭据文件

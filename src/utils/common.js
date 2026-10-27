@@ -366,9 +366,22 @@ function applyCredentialCooldown(error, config, providerPoolManager, providerTyp
         ? '429 RESOURCE_EXHAUSTED - quota recovery scheduled'
         : '429 Too Many Requests - short cooldown';
     logger.info(`[Provider Pool] ${logPrefix} applying cooldown for ${providerType} (${pooluuid}) until ${rateLimitRecoveryTime.toISOString()}`);
-    providerPoolManager.markProviderUnhealthyWithRecoveryTime(providerType, {
-        uuid: pooluuid
-    }, reason, rateLimitRecoveryTime);
+    // Antigravity Gemini and third-party (Claude/GPT) quotas are independent books.
+    // Quarantine only the exhausted family so the account stays usable for the other.
+    if (quotaExhausted && quotaRecoveryTime && providerType === MODEL_PROVIDER.ANTIGRAVITY &&
+        model && typeof providerPoolManager.markAntigravityQuotaExhausted === 'function') {
+        providerPoolManager.markAntigravityQuotaExhausted(providerType, {
+            uuid: pooluuid
+        }, {
+            model,
+            recoveryTime: quotaRecoveryTime,
+            errorMessage: reason
+        });
+    } else {
+        providerPoolManager.markProviderUnhealthyWithRecoveryTime(providerType, {
+            uuid: pooluuid
+        }, reason, rateLimitRecoveryTime);
+    }
     if (quotaRecoveryTime && !String(error.message || '').includes('Quota is expected to recover')) {
         error.message = `${error.message || 'Quota exhausted.'}${formatQuotaRecovery(quotaRecoveryTime)}`;
     }
@@ -1055,6 +1068,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     let hasMessageStop = false; // 跟踪是否已经发送过结束标志（message_stop / done）
     let streamAttemptFinished = false;
     let responseFailureAttempts = retryContext?.responseFailureRetry ?? retryContext?.emptyResponseRetry ?? 0;
+    let nextResponseSequenceNumber = 0;
     // finally 必须能访问这两个值：客户端 close、上游 throw 和无终止块 EOF 都要释放状态。
     // generateContentStream 初始化失败前 streamRequestId 仍为空，安全跳过清理。
     let needsConversion = false;
@@ -1462,6 +1476,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     try {
                         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
                         anyDataSent = true;
+                        if (clientProtocol === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES) {
+                            const sequence = chunk?.sequence_number;
+                            nextResponseSequenceNumber = Number.isInteger(sequence) && sequence >= 0
+                                ? Math.max(nextResponseSequenceNumber, sequence + 1)
+                                : nextResponseSequenceNumber + 1;
+                        }
                     } catch (writeErr) {
                         logger.error('[Stream] Failed to write data:', writeErr.message);
                         clientDisconnected.value = true;
@@ -1546,7 +1566,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (anyDataSent) {
             logger.info(`[Stream Retry] Cannot retry: data already sent to client`);
             // 直接发送错误并结束
-            const errorPayload = createStreamErrorResponse(error, fromProvider);
+            const errorPayload = createStreamErrorResponse(error, fromProvider, nextResponseSequenceNumber);
             if (!res.writableEnded) {
                 try {
                     res.write(errorPayload);
@@ -1597,7 +1617,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
             const giveUpError = new Error(`${toProvider} upstream response failed with ${failureLabel} after ${attemptsMade} retr${attemptsMade === 1 ? 'y' : 'ies'} using the same request. Please try again, or /clear your session if this keeps happening.`);
             giveUpError.status = 502;
-            const errorPayload = createStreamErrorResponse(giveUpError, fromProvider);
+            const errorPayload = createStreamErrorResponse(giveUpError, fromProvider, nextResponseSequenceNumber);
             if (!clientDisconnected.value && !res.writableEnded) {
                 try {
                     res.write(errorPayload);
@@ -1712,7 +1732,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
 
         // 使用新方法创建符合 fromProvider 格式的流式错误响应
-        const errorPayload = createStreamErrorResponse(error, fromProvider);
+        const errorPayload = createStreamErrorResponse(error, fromProvider, nextResponseSequenceNumber);
         if (!clientDisconnected.value && !res.writableEnded) {
             try {
                 res.write(errorPayload);
@@ -2837,7 +2857,7 @@ function createErrorResponse(error, fromProvider) {
                 error: {
                     message: errorMessage,
                     type: getErrorType(statusCode),
-                    code: getErrorType(statusCode)  // OpenAI 使用 code 字段作为核心判断
+                    code: error.responseFailureCode || getErrorType(statusCode)  // Preserve normalized upstream failure codes
                 }
             };
             
@@ -2847,7 +2867,7 @@ function createErrorResponse(error, fromProvider) {
                 error: {
                     type: getErrorType(statusCode),
                     message: errorMessage,
-                    code: getErrorType(statusCode)
+                    code: error.responseFailureCode || getErrorType(statusCode)
                 }
             };
             
@@ -2887,9 +2907,10 @@ function createErrorResponse(error, fromProvider) {
  * 创建符合 fromProvider 格式的流式错误响应
  * @param {Error} error - 错误对象
  * @param {string} fromProvider - 客户端期望的提供商格式
+ * @param {number} sequenceNumber - Responses API error event sequence after the sent frames.
  * @returns {string} 格式化的流式错误响应字符串
  */
-function createStreamErrorResponse(error, fromProvider) {
+function createStreamErrorResponse(error, fromProvider, sequenceNumber = 0) {
     const protocolPrefix = getProtocolPrefix(fromProvider);
     const rawStatusCode = error.status || error.code || 500;
     const statusCode = ensureValidStatusCode(rawStatusCode);
@@ -2922,7 +2943,7 @@ function createStreamErrorResponse(error, fromProvider) {
                 error: {
                     message: errorMessage,
                     type: getErrorType(statusCode),
-                    code: null
+                    code: error.responseFailureCode || null
                 }
             };
             return `data: ${JSON.stringify(openaiError)}\n\n`;
@@ -2930,14 +2951,11 @@ function createStreamErrorResponse(error, fromProvider) {
         case MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES:
             // OpenAI Responses API 流式错误格式（SSE event + data）
             const responsesError = {
-                id: `resp_${Date.now()}`,
-                object: "error",
-                created: Math.floor(Date.now() / 1000),
-                error: {
-                    type: getErrorType(statusCode),
-                    message: errorMessage,
-                    code: getErrorType(statusCode)
-                }
+                type: 'error',
+                sequence_number: sequenceNumber,
+                code: error.responseFailureCode || getErrorType(statusCode),
+                message: errorMessage,
+                param: null
             };
             return `event: error\ndata: ${JSON.stringify(responsesError)}\n\n`;
             
@@ -2971,7 +2989,7 @@ function createStreamErrorResponse(error, fromProvider) {
                 error: {
                     message: errorMessage,
                     type: getErrorType(statusCode),
-                    code: null
+                    code: error.responseFailureCode || null
                 }
             };
             return `data: ${JSON.stringify(defaultError)}\n\n`;

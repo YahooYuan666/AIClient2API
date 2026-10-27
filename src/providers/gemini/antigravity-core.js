@@ -31,10 +31,18 @@ const ANTIGRAVITY_BASE_URL_DAILY = 'https://daily-cloudcode-pa.googleapis.com';
 const ANTIGRAVITY_BASE_URL_PROD = 'https://cloudcode-pa.googleapis.com';
 
 const ANTIGRAVITY_API_VERSION = 'v1internal';
-const ANTIGRAVITY_FREE_PLAN_THIRD_PARTY_CUTOFF = Date.UTC(2026, 10, 3);
+// Local free-tier compatibility policy and upstream references:
+// docs/ANTIGRAVITY_FREE_TIER_MODELS.md (not an exhaustive upstream entitlement list).
+const ANTIGRAVITY_FREE_TIER_MODELS = new Set([
+    'gemini-3.8-flash-high',
+    'gemini-3.8-flash-medium',
+    'gemini-3.8-flash-low'
+]);
 const OAUTH_CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com';
 const OAUTH_CLIENT_SECRET = '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';
 const DEFAULT_USER_AGENT = 'antigravity/2.8.1 darwin/arm64';
+// Argon is available through the CLI/App, not the IDE client.
+const ANTIGRAVITY_CLI_USER_AGENT = 'antigravity/cli/1.4.2 darwin/arm64';
 const REFRESH_SKEW = 3000; // 3000秒（50分钟）提前刷新Token
 
 const ANTIGRAVITY_SYSTEM_PROMPT = `You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**`;
@@ -57,11 +65,13 @@ const ANTIGRAVITY_STREAM_IDLE_TIMEOUT_MS = 300000;
 // 超过该行数认为不是「一次性 JSON 响应」，放弃缓存以免长流吃内存。
 const ANTIGRAVITY_RAW_FALLBACK_MAX_LINES = 20000;
 const ANTIGRAVITY_ERROR_BODY_MAX_BYTES = 1024 * 1024;
+const ANTIGRAVITY_STREAM_ERROR_CONTEXT_CHARS = 2048;
 
 // 获取 Antigravity 模型列表
 const ANTIGRAVITY_MODELS = getProviderModels(MODEL_PROVIDER.ANTIGRAVITY);
 
 const ANTIGRAVITY_CLIENT_TO_UPSTREAM_MODEL = {
+    'gemini-4-argon': 'gemini-4-argon-medium',
     'gemini-3.1-pro-high': 'gemini-pro-agent',
     'gemini-3.1-pro-preview': 'gemini-pro-agent',
     'gemini-3.5-flash-high': 'gemini-3.5-flash-low',
@@ -74,6 +84,7 @@ const ANTIGRAVITY_CLIENT_TO_UPSTREAM_MODEL = {
 };
 
 const ANTIGRAVITY_UPSTREAM_TO_CLIENT_MODELS = {
+    'gemini-4-argon-medium': ['gemini-4-argon'],
     'gemini-pro-agent': ['gemini-3.1-pro-high', 'gemini-3.1-pro-preview'],
     'gemini-3.6-flash-low': ['gemini-3.6-flash', 'gemini-3.6-flash-low', 'gemini-3.6-flash-medium'],
     'gemini-3.7-flash-low': ['gemini-3.7-flash', 'gemini-3.7-flash-low', 'gemini-3.7-flash-medium'],
@@ -81,6 +92,8 @@ const ANTIGRAVITY_UPSTREAM_TO_CLIENT_MODELS = {
 };
 
 const ANTIGRAVITY_CLIENT_MODEL_THINKING_LEVEL = {
+    'gemini-4-argon': 'medium',
+    'gemini-4-argon-high': 'high',
     'gemini-pro-agent': 'high',
     'gemini-3.1-pro-high': 'high',
     'gemini-3.1-pro-preview': 'high',
@@ -102,6 +115,12 @@ const ANTIGRAVITY_CLIENT_MODEL_THINKING_LEVEL = {
 };
 
 const ANTIGRAVITY_MODEL_METADATA = {
+    'gemini-4-argon-medium': {
+        thinking: { levels: ['low', 'medium', 'high'] }
+    },
+    'gemini-4-argon-high': {
+        thinking: { levels: ['low', 'medium', 'high'] }
+    },
     'claude-opus-4-6-thinking': {
         maxOutputTokens: 64000,
         thinking: { min: 1024, max: 64000, zeroAllowed: true, dynamicAllowed: true }
@@ -201,7 +220,7 @@ function stripModelSuffix(modelName) {
     return match ? match[1].trim() : normalized;
 }
 
-function resolveAntigravityUpstreamModel(modelName) {
+export function resolveAntigravityUpstreamModel(modelName) {
     const baseModel = stripModelSuffix(modelName);
     if (!baseModel) return '';
     if (baseModel.startsWith('gemini-claude-')) {
@@ -210,10 +229,24 @@ function resolveAntigravityUpstreamModel(modelName) {
     return ANTIGRAVITY_CLIENT_TO_UPSTREAM_MODEL[baseModel] || baseModel;
 }
 
+function getAntigravityRequestUserAgent(modelName, userAgent) {
+    if (resolveAntigravityUpstreamModel(modelName).startsWith('gemini-4-argon')) {
+        return userAgent?.startsWith('antigravity/cli/') ? userAgent : ANTIGRAVITY_CLI_USER_AGENT;
+    }
+    return userAgent;
+}
+
+// Requests are authorized by their upstream target, not by the exposed alias.
+// Keep the client model intact when building payloads so Medium retains its thinking level.
 export function isAntigravityModelRetired(modelName, now = Date.now(), tierId) {
-    const upstreamModel = resolveAntigravityUpstreamModel(modelName);
-    return tierId === 'free-tier' && now >= ANTIGRAVITY_FREE_PLAN_THIRD_PARTY_CUTOFF &&
-        (upstreamModel.startsWith('claude-') || upstreamModel.startsWith('gpt-oss-'));
+    if (tierId !== 'free-tier') return false;
+    return !ANTIGRAVITY_FREE_TIER_MODELS.has(resolveAntigravityUpstreamModel(modelName));
+}
+
+// Listings intentionally expose only the three thinking variants on free accounts.
+// Legacy aliases remain accepted by the request policy above without adding UI entries.
+export function isAntigravityModelListed(modelName, tierId) {
+    return tierId !== 'free-tier' || ANTIGRAVITY_FREE_TIER_MODELS.has(stripModelSuffix(modelName));
 }
 
 function expandAntigravityClientModels(upstreamModel) {
@@ -905,31 +938,95 @@ function convertStreamToNonStream(stream) {
     return output;
 }
 
-/**
- * 将 Antigravity 响应转换为 Gemini 格式
- * @param {Object} antigravityResponse - Antigravity 响应
- * @returns {Object|null} Gemini 格式响应
- */
-function toGeminiApiResponse(antigravityResponse) {
-    if (!antigravityResponse) return null;
+function getAntigravityStreamErrorText(response) {
+    const candidate = response?.candidates?.[0];
+    if (typeof candidate?.finishMessage === 'string' && candidate.finishMessage.trim()) {
+        return candidate.finishMessage;
+    }
+    return (Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [])
+        .filter(part => part?.thought !== true && typeof part?.text === 'string')
+        .map(part => part.text).join('');
+}
 
-    const compliantResponse = {
-        candidates: antigravityResponse.candidates
-    };
+function createAntigravityResponseError(message, code, status = 502) {
+    const error = new Error(`[Antigravity] ${message}`);
+    error.status = status;
+    error.responseFailureCode = code;
+    error.skipErrorCount = true;
+    error.shouldSwitchCredential = false;
+    return error;
+}
 
-    if (antigravityResponse.usageMetadata) {
-        compliantResponse.usageMetadata = antigravityResponse.usageMetadata;
+/** Antigravity-local unwrapping and error handling; other Gemini providers are unchanged. */
+function toGeminiApiResponse(envelope) {
+    if (!envelope) return null;
+    const response = envelope.response || envelope;
+    const upstreamError = envelope.error || response.error;
+    if (upstreamError) {
+        const status = Number(upstreamError.code);
+        const error = createAntigravityResponseError(
+            typeof upstreamError === 'string' ? upstreamError : upstreamError.message || 'Upstream returned an error.',
+            upstreamError.status || 'UPSTREAM_ERROR',
+            Number.isInteger(status) && status >= 400 && status <= 599 ? status : 502
+        );
+        error.response = { status: error.status, data: { error: upstreamError } };
+        error.skipErrorCount = error.status === 400;
+        throw error;
     }
 
-    if (antigravityResponse.promptFeedback) {
-        compliantResponse.promptFeedback = antigravityResponse.promptFeedback;
+    const feedback = response.promptFeedback;
+    if (feedback?.blockReason && feedback.blockReason !== 'BLOCK_REASON_UNSPECIFIED') {
+        throw createAntigravityResponseError(
+            feedback.blockReasonMessage || getAntigravityStreamErrorText(response) || `Upstream blocked the request (${feedback.blockReason}).`,
+            'content_filter',
+            400
+        );
     }
+    // Ignore heartbeat frames rather than forwarding an undefined candidate payload.
+    if (!response.candidates && !response.usageMetadata && !feedback && !response.automaticFunctionCallingHistory) return null;
 
-    if (antigravityResponse.automaticFunctionCallingHistory) {
-        compliantResponse.automaticFunctionCallingHistory = antigravityResponse.automaticFunctionCallingHistory;
+    const compliantResponse = { candidates: response.candidates };
+    if (response.usageMetadata) compliantResponse.usageMetadata = response.usageMetadata;
+    if (feedback) compliantResponse.promptFeedback = feedback;
+    if (response.automaticFunctionCallingHistory) {
+        compliantResponse.automaticFunctionCallingHistory = response.automaticFunctionCallingHistory;
     }
-
     return compliantResponse;
+}
+
+/** Validate Antigravity's native stream before the shared layer performs protocol conversion. */
+async function* normalizeAntigravityContentStream(stream) {
+    let sawCandidate = false;
+    let completed = false;
+    let errorContext = '';
+    let contextTruncated = false;
+    for await (const chunk of stream) {
+        const response = toGeminiApiResponse(chunk);
+        if (!response) continue;
+        if (Array.isArray(response.candidates) && response.candidates.length > 0) {
+            sawCandidate = true;
+            completed ||= response.candidates.some(candidate =>
+                typeof candidate?.finishReason === 'string' && candidate.finishReason.trim().length > 0);
+        }
+        const text = getAntigravityStreamErrorText(response);
+        if (text) {
+            const context = errorContext + text;
+            contextTruncated ||= context.length > ANTIGRAVITY_STREAM_ERROR_CONTEXT_CHARS;
+            errorContext = context.slice(-ANTIGRAVITY_STREAM_ERROR_CONTEXT_CHARS);
+        }
+        yield response;
+    }
+    // Reached only on natural upstream EOF, not on iterator.return() / client cancellation.
+    if (sawCandidate && !completed) {
+        const text = errorContext.trim();
+        const context = text
+            ? `Upstream response (may be partial): ${contextTruncated ? '…' : ''}${text}\n`
+            : 'No upstream explanation was provided. ';
+        throw createAntigravityResponseError(
+            `${context}Stream diagnostic: upstream ended without a completion reason (finishReason); the response is incomplete.`,
+            'INCOMPLETE_UPSTREAM_STREAM'
+        );
+    }
 }
 
 /**
@@ -1035,6 +1132,7 @@ export class AntigravityApiService {
         });
 
         this.availableModels = [];
+        this.availableModelsSource = 'unknown';
         this.isInitialized = false;
 
         this.config = config;
@@ -1379,7 +1477,7 @@ export class AntigravityApiService {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
-                        'User-Agent': this.userAgent
+                        'User-Agent': getAntigravityRequestUserAgent('gemini-4-argon', this.userAgent)
                     },
                     responseType: 'json',
                     body: JSON.stringify(this.projectId ? { project: this.projectId } : {})
@@ -1398,6 +1496,7 @@ export class AntigravityApiService {
                             return true;
                         });
 
+                    this.availableModelsSource = 'upstream';
                     logger.info(`[Antigravity] Available models: [${this.availableModels.join(', ')}]`);
                     return;
                 }
@@ -1408,6 +1507,7 @@ export class AntigravityApiService {
 
         logger.warn('[Antigravity] Failed to fetch models from all endpoints. Using default models.');
         this.availableModels = ANTIGRAVITY_MODELS;
+        this.availableModelsSource = 'fallback';
     }
 
     async listModels() {
@@ -1416,7 +1516,7 @@ export class AntigravityApiService {
         const currentTime = Date.now();
         const now = Math.floor(currentTime / 1000);
         const formattedModels = this.availableModels
-            .filter(modelId => !isAntigravityModelRetired(modelId, currentTime, this.tierId))
+            .filter(modelId => isAntigravityModelListed(modelId, this.tierId))
             .map(modelId => {
                 const displayName = modelId.split('-').map(word =>
                     word.charAt(0).toUpperCase() + word.slice(1)
@@ -1471,7 +1571,7 @@ export class AntigravityApiService {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'User-Agent': this.userAgent
+                    'User-Agent': getAntigravityRequestUserAgent(body?.model, this.userAgent)
                 },
                 responseType: 'json',
                 body: JSON.stringify(body)
@@ -1586,7 +1686,7 @@ export class AntigravityApiService {
                 headers: {
                     'Content-Type': 'application/json',
                     'Accept': 'text/event-stream',
-                    'User-Agent': this.userAgent
+                    'User-Agent': getAntigravityRequestUserAgent(body?.model, this.userAgent)
                 },
                 responseType: 'stream',
                 // 阻止 gaxios 在非 2xx 时自行消耗流并抛异常，
@@ -1981,9 +2081,9 @@ export class AntigravityApiService {
     buildAntigravityPayload(model, requestBody) {
         let selectedModel = normalizeAntigravityModelId(model);
         if (isAntigravityModelRetired(selectedModel, Date.now(), this.tierId)) {
-            const error = new Error(`[Antigravity] Free-plan access to non-Gemini model '${selectedModel}' ended on 2026-11-03.`);
-            error.status = 400;
-            error.response = { status: 400 };
+            const error = new Error(`[Antigravity] Model '${selectedModel}' is unavailable on the free tier. Available models: ${[...ANTIGRAVITY_FREE_TIER_MODELS].join(', ')}.`);
+            error.status = 404;
+            error.response = { status: 404 };
             error.skipErrorCount = true;
             throw error;
         }
@@ -2024,7 +2124,7 @@ export class AntigravityApiService {
         }
 
         const response = await this.callApi('generateContent', payload);
-        return toGeminiApiResponse(response.response);
+        return toGeminiApiResponse(response);
     }
 
     /**
@@ -2037,11 +2137,9 @@ export class AntigravityApiService {
         const chunks = [];
         
         try {
-            const stream = this.streamApi('streamGenerateContent', payload);
+            const stream = normalizeAntigravityContentStream(this.streamApi('streamGenerateContent', payload));
             for await (const chunk of stream) {
-                if (chunk) {
-                    chunks.push(JSON.stringify(chunk));
-                }
+                chunks.push(JSON.stringify(chunk));
             }
             
             // 将流式响应转换为非流式响应
@@ -2061,15 +2159,7 @@ export class AntigravityApiService {
         this.prepareRequestMetadata(requestBody);
         const { payload } = this.buildAntigravityPayload(model, requestBody);
 
-        const stream = this.streamApi('streamGenerateContent', payload);
-        for await (const chunk of stream) {
-            // 上游可能出现不含 response 字段的帧（错误帧/心跳等），此时 toGeminiApiResponse 返回 null。
-            // 不能把 null 透传给下游：common.js 的 extractResponseText 会直接读 response.candidates 而抛错，
-            // 导致整条流因为一个无关帧而中断。
-            const converted = toGeminiApiResponse(chunk?.response);
-            if (!converted) continue;
-            yield converted;
-        }
+        yield* normalizeAntigravityContentStream(this.streamApi('streamGenerateContent', payload));
     }
 
     isExpiryDateNear() {
@@ -2082,6 +2172,66 @@ export class AntigravityApiService {
             logger.error(`[Antigravity] Error checking expiry date: ${error.message}`);
             return false;
         }
+    }
+
+    async _requestQuotaEndpoint(endpoint) {
+        if (!this.isInitialized) await this.initialize();
+
+        for (const baseURL of this.baseURLs) {
+            try {
+                const requestOptions = {
+                    url: `${baseURL}/${ANTIGRAVITY_API_VERSION}:${endpoint}`,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'User-Agent': this.userAgent
+                    },
+                    responseType: 'json',
+                    body: JSON.stringify({ project: this.projectId })
+                };
+
+                this._applySidecar(requestOptions);
+                const response = await this.authClient.request(requestOptions);
+                if (response.data) return response.data;
+            } catch (error) {
+                logger.warn(`[Antigravity] Failed to fetch ${endpoint} from ${baseURL}:`, error.message);
+            }
+        }
+
+        throw new Error(`Failed to fetch ${endpoint} from all endpoints`);
+    }
+
+    async getQuotaSummary() {
+        if (!this.isInitialized) await this.initialize();
+
+        const hasRemainingFraction = quota => {
+            const remaining = quota?.remaining || {};
+            const fraction = quota?.remainingFraction ?? quota?.remaining_fraction ??
+                remaining.remainingFraction ?? remaining.remaining_fraction;
+            return fraction !== null && fraction !== undefined && fraction !== '' &&
+                typeof fraction !== 'boolean' && Number.isFinite(Number(fraction));
+        };
+
+        try {
+            const summary = await this._requestQuotaEndpoint('retrieveUserQuotaSummary');
+            if ((summary.groups || []).some(group => group?.buckets?.some(hasRemainingFraction))) {
+                return { source: 'summary', groups: summary.groups };
+            }
+        } catch (error) {
+            logger.info(`[Antigravity] Quota summary unavailable, trying fallback: ${error.message}`);
+        }
+
+        try {
+            const quota = await this._requestQuotaEndpoint('retrieveUserQuota');
+            if ((quota.buckets || []).some(hasRemainingFraction)) {
+                return { source: 'quota', buckets: quota.buckets };
+            }
+        } catch (error) {
+            logger.info(`[Antigravity] Per-model quota unavailable, trying catalog fallback: ${error.message}`);
+        }
+
+        const catalog = await this.getUsageLimits();
+        return { source: 'models', models: catalog?.models || {} };
     }
 
     /**
