@@ -23,3 +23,4 @@ src/plugins-user/
 
 /.codegraph/
 configs/node-guard-state.json
+.private/
