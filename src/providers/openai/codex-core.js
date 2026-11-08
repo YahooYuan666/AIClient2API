@@ -11,7 +11,17 @@ import {configureTLSSidecar, isTLSSidecarEnabledForProvider} from '../../utils/p
 import {MODEL_PROVIDER, formatExpiryLog, normalizeProviderErrorMessage} from '../../utils/common.js';
 import {getProxyConfigForProvider} from '../../utils/proxy-utils.js';
 import {getProviderModels} from '../provider-models.js';
-import {normalizeCodexInstructions, resolveCodexCacheIdentity} from './codex-request-utils.js';
+import {
+    normalizeCodexInstructions,
+    resolveCodexCacheIdentity,
+    resolveCodexReasoningEffort,
+    isCodexImageComplexityMessage,
+    getCodexImageEffortRetryBody,
+    canRecoverCodexImageRequest,
+    getCodexGeneratedImages,
+    isCodexIncompleteImageResponse,
+    mergeCodexImageRecovery
+} from './codex-request-utils.js';
 
 const baseModels = getProviderModels(MODEL_PROVIDER.CODEX_API);
 const fastModels = baseModels.map(m => `${m}-fast`);
@@ -37,6 +47,15 @@ function normalizeCodexTerminalError(parsed) {
         }
     }
 
+    // Some tool failures are carried inside an otherwise successful Responses envelope.
+    // Do not infer failure from assistant text or replace a successfully generated image.
+    if (!errorBody) {
+        const output = parsed.type === 'response.output_item.done' ? [parsed.item] : parsed.response?.output;
+        if (Array.isArray(output) && !output.some(item => item?.type === 'image_generation_call' && item.result)) {
+            errorBody = output.find(item => item?.type === 'image_generation_call'
+                && isCodexImageComplexityMessage(item.error?.message))?.error;
+        }
+    }
     if (!errorBody) {
         return null;
     }
@@ -298,46 +317,61 @@ export class CodexApiService {
         }
 
         const url = `${this.baseUrl}/responses`;
-        const body = await this.prepareRequestBody(selectedModel, requestBody, true);
+        let body = await this.prepareRequestBody(selectedModel, requestBody, true);
         const headers = this.buildHeaders(body.prompt_cache_key, true);
+        let imageEffortRetried = false;
 
-        try {
-            const config = {
-                headers,
-                responseType: 'text', // 确保以文本形式接收 SSE 流
-                timeout: 300000 // 5 分钟超时，适应慢速模型
-            };
+        while (true) {
+            try {
+                const config = {
+                    headers,
+                    responseType: 'text', // 确保以文本形式接收 SSE 流
+                    timeout: 300000 // 5 分钟超时，适应慢速模型
+                };
 
-            const axiosRequestConfig = {
-                method: 'post',
-                url,
-                data: body,
-                ...config
-            };
-            this._applySidecar(axiosRequestConfig);
+                const axiosRequestConfig = {
+                    method: 'post',
+                    url,
+                    data: body,
+                    ...config
+                };
+                this._applySidecar(axiosRequestConfig);
 
-            const response = await axios.request(axiosRequestConfig);
+                const response = await axios.request(axiosRequestConfig);
 
-            return this.parseNonStreamResponse(response.data);
-        } catch (error) {
-            if (error.response?.status === 401) {
-                logger.info('[Codex] Received 401. Triggering background refresh...');
-                await normalizeProviderErrorMessage(error, { status: 401, context: 'non-stream' });
-
-                // 触发后台异步刷新
-                this.triggerBackgroundRefresh();
-                error.credentialMarkedUnhealthy = true;
-
-                // Mark error for credential switch without recording error count
-                error.shouldSwitchCredential = true;
-                error.skipErrorCount = true;
-                throw error;
-            } else {
-                if (error.response?.status) {
-                    await normalizeProviderErrorMessage(error, { status: error.response.status, context: 'non-stream' });
+                const parsed = this.parseNonStreamResponse(response.data);
+                if (!imageEffortRetried && isCodexIncompleteImageResponse(parsed, body)) {
+                    imageEffortRetried = true;
+                    return mergeCodexImageRecovery(parsed, await this.recoverIncompleteImageResponse(body));
                 }
-                logger.error(`[Codex] Error calling non-stream API (Status: ${error.response?.status}, Code: ${error.code || 'N/A'}): ${error.message}`);
-                throw error;
+                return parsed;
+            } catch (error) {
+                if (error.response?.status === 401) {
+                    logger.info('[Codex] Received 401. Triggering background refresh...');
+                    await normalizeProviderErrorMessage(error, { status: 401, context: 'non-stream' });
+
+                    // 触发后台异步刷新
+                    this.triggerBackgroundRefresh();
+                    error.credentialMarkedUnhealthy = true;
+
+                    // Mark error for credential switch without recording error count
+                    error.shouldSwitchCredential = true;
+                    error.skipErrorCount = true;
+                    throw error;
+                } else {
+                    if (error.response?.status) {
+                        await normalizeProviderErrorMessage(error, { status: error.response.status, context: 'non-stream' });
+                    }
+                    const retryBody = !imageEffortRetried && getCodexImageEffortRetryBody(error, body);
+                    if (retryBody) {
+                        imageEffortRetried = true;
+                        body = retryBody;
+                        logger.warn('[Codex] Image complexity error; retrying this request once with reasoning.effort=null (same credential).');
+                        continue;
+                    }
+                    logger.error(`[Codex] Error calling non-stream API (Status: ${error.response?.status}, Code: ${error.code || 'N/A'}): ${error.message}`);
+                    throw error;
+                }
             }
         }
     }
@@ -375,48 +409,192 @@ export class CodexApiService {
         }
 
         const url = `${this.baseUrl}/responses`;
-        const body = await this.prepareRequestBody(selectedModel, requestBody, true);
+        let body = await this.prepareRequestBody(selectedModel, requestBody, true);
         const headers = this.buildHeaders(body.prompt_cache_key, true);
+        let imageEffortRetried = false;
+        let emittedEvent = false;
 
-        try {
-            const config = {
-                headers,
-                responseType: 'stream',
-                timeout: 300000 // 5 分钟超时
-            };
+        while (true) {
+            try {
+                const config = {
+                    headers,
+                    responseType: 'stream',
+                    timeout: 300000 // 5 分钟超时
+                };
 
-            const axiosRequestConfig = {
-                method: 'post',
-                url,
-                data: body,
-                ...config
-            };
-            this._applySidecar(axiosRequestConfig);
+                const axiosRequestConfig = {
+                    method: 'post',
+                    url,
+                    data: body,
+                    ...config
+                };
+                this._applySidecar(axiosRequestConfig);
 
-            const response = await axios.request(axiosRequestConfig);
+                const response = await axios.request(axiosRequestConfig);
 
-            yield* this.parseSSEStream(response.data);
-        } catch (error) {
-            if (error.response?.status === 401) {
-                logger.info('[Codex] Received 401 during stream. Triggering background refresh...');
-                await normalizeProviderErrorMessage(error, { status: 401, context: 'stream' });
-
-                // 触发后台异步刷新
-                this.triggerBackgroundRefresh();
-                error.credentialMarkedUnhealthy = true;
-
-                // Mark error for credential switch without recording error count
-                error.shouldSwitchCredential = true;
-                error.skipErrorCount = true;
-                throw error;
-            } else {
-                if (error.response?.status) {
-                    await normalizeProviderErrorMessage(error, { status: error.response.status, context: 'stream' });
+                // Buffer only a bounded bootstrap prelude, not text/reasoning/tool output.
+                // An early parameter failure can then retry without leaking duplicate response IDs.
+                const prelude = [];
+                for await (const event of this.parseSSEStreamWithImageRecovery(response.data, body)) {
+                    if (!emittedEvent && prelude.length < 16
+                        && ['response.created', 'response.in_progress', 'response.queued'].includes(event.type)) {
+                        prelude.push(event);
+                        continue;
+                    }
+                    emittedEvent = true;
+                    yield* prelude.splice(0);
+                    yield event;
                 }
-                logger.error(`[Codex] Error calling streaming API (Status: ${error.response?.status}, Code: ${error.code || 'N/A'}):`, error.message);
-                throw error;
+                yield* prelude;
+                return;
+            } catch (error) {
+                if (error.response?.status === 401) {
+                    logger.info('[Codex] Received 401 during stream. Triggering background refresh...');
+                    await normalizeProviderErrorMessage(error, { status: 401, context: 'stream' });
+
+                    // 触发后台异步刷新
+                    this.triggerBackgroundRefresh();
+                    error.credentialMarkedUnhealthy = true;
+
+                    // Mark error for credential switch without recording error count
+                    error.shouldSwitchCredential = true;
+                    error.skipErrorCount = true;
+                    throw error;
+                } else {
+                    if (error.response?.status) {
+                        await normalizeProviderErrorMessage(error, { status: error.response.status, context: 'stream' });
+                    }
+                    const retryBody = !emittedEvent && !imageEffortRetried && getCodexImageEffortRetryBody(error, body);
+                    if (retryBody) {
+                        imageEffortRetried = true;
+                        body = retryBody;
+                        logger.warn('[Codex] Early image complexity error; retrying this stream once with reasoning.effort=null (same credential).');
+                        continue;
+                    }
+                    logger.error(`[Codex] Error calling streaming API (Status: ${error.response?.status}, Code: ${error.code || 'N/A'}):`, error.message);
+                    throw error;
+                }
             }
         }
+    }
+
+    /** Use the same image-only preparation as /v1/images, once an actual image call stalled. */
+    async recoverIncompleteImageResponse(body) {
+        logger.warn('[Codex] Completed response has unfinished image calls and zero image usage; recovering once with the image-only helper and reasoning.effort=null.');
+        try {
+            const imageTool = body.tools.find(tool => tool?.type === 'image_generation');
+            const imageBody = await this.prepareRequestBody('gpt-image-2', {
+                ...body,
+                _imageSize: body._imageSize || imageTool?.size,
+                tool_choice: { type: 'image_generation' },
+                reasoning: { ...body.reasoning, effort: null }
+            }, true);
+            const config = {
+                method: 'post', url: `${this.baseUrl}/responses`, data: imageBody,
+                headers: this.buildHeaders(imageBody.prompt_cache_key, true),
+                responseType: 'text', timeout: 300000
+            };
+            this._applySidecar(config);
+            const response = await axios.request(config);
+            const recovered = this.parseNonStreamResponse(response.data);
+            const images = getCodexGeneratedImages(recovered.response);
+            if (images.length === 0) {
+                const error = new Error('Codex image recovery failed: the image-only request returned no image result.');
+                error.response = { status: 502, data: { error: { message: error.message, code: 'image_generation_incomplete' } } };
+                error.skipErrorCount = true;
+                throw error;
+            }
+            for (const image of images) {
+                image.id = image.id || `ig_${crypto.randomUUID()}`;
+                image.status = 'completed';
+            }
+            return recovered;
+        } catch (error) {
+            // Never chain a second compatibility retry or a generic health-based replay
+            // onto an image request whose delivery outcome may now be unknown.
+            error.imageRecoveryAttempted = true;
+            error.skipErrorCount = true;
+            throw error;
+        }
+    }
+
+    /**
+     * Keep normal chat streaming. Only buffer the tail after a real image call starts,
+     * so a failed image segment can be replaced without replaying earlier reasoning.
+     */
+    async* parseSSEStreamWithImageRecovery(stream, body) {
+        if (!canRecoverCodexImageRequest(body)) {
+            yield* this.parseSSEStream(stream);
+            return;
+        }
+        let tail = [];
+        let tailBytes = 0;
+        let disabled = false;
+        let lastSequence = -1;
+        let completed = null;
+        let textEmitted = false;
+        const committedItems = new Set();
+        const emitted = event => {
+            lastSequence = Math.max(lastSequence + 1, event.sequence_number ?? -1);
+            if (event.type === 'response.output_item.added' && event.item?.id) committedItems.add(event.item.id);
+            if (event.type === 'response.output_text.delta' || event.item?.type === 'message') textEmitted = true;
+            // Interleaved prefix events can overtake buffered tail events; keep wire order monotonic.
+            return typeof event.sequence_number === 'number' && event.sequence_number !== lastSequence
+                ? { ...event, sequence_number: lastSequence } : event;
+        };
+        for await (const event of this.parseSSEStream(stream)) {
+            // Interleaved reasoning/text belonging to an already committed prefix must still close.
+            if (tail.length && committedItems.has(event.item_id || event.item?.id)) {
+                yield emitted(event);
+                continue;
+            }
+            const eventType = String(event.type || '');
+            const imageEvent = event.item?.type === 'image_generation_call'
+                || eventType.startsWith('response.image_generation_call.');
+            const terminalImageOnly = !textEmitted && isCodexIncompleteImageResponse(event, body);
+            if (!disabled && (tail.length || imageEvent || terminalImageOnly)) {
+                const imageDelivered = Boolean(event.partial_image_b64)
+                    || getCodexGeneratedImages({ output: event.item ? [event.item] : event.response?.output }).length > 0;
+                const hasOtherTool = (event.item?.type
+                    && !['reasoning', 'message', 'image_generation_call'].includes(event.item.type))
+                    || eventType.startsWith('response.function_call_arguments.');
+                const bytes = imageDelivered ? 0 : Buffer.byteLength(JSON.stringify(event));
+                if (imageDelivered || hasOtherTool || tailBytes + bytes > 1024 * 1024 || tail.length >= 512) {
+                    // Do not duplicate delivered images, hide function calls or buffer without bound.
+                    disabled = true;
+                    for (const buffered of tail) yield emitted(buffered);
+                    tail = [];
+                } else {
+                    tail.push(event);
+                    tailBytes += bytes;
+                    if (event.type === 'response.completed') completed = event;
+                    continue;
+                }
+            }
+            yield emitted(event);
+        }
+        if (!tail.length) return;
+        if (!completed || !isCodexIncompleteImageResponse(completed, body)) {
+            for (const event of tail) yield emitted(event);
+            return;
+        }
+
+        const recovered = await this.recoverIncompleteImageResponse(body);
+        const merged = mergeCodexImageRecovery(completed, recovered);
+        const prefixLength = completed.response.output.findIndex(item => item.type === 'image_generation_call');
+        for (const [index, image] of getCodexGeneratedImages(recovered.response).entries()) {
+            const output_index = prefixLength + index;
+            yield emitted({
+                type: 'response.output_item.added', response_id: merged.response.id,
+                output_index, sequence_number: lastSequence + 1,
+                item: { id: image.id, type: 'image_generation_call', status: 'in_progress' }
+            });
+            yield emitted({
+                type: 'response.output_item.done', response_id: merged.response.id,
+                output_index, sequence_number: lastSequence + 1, item: image
+            });
+        }
+        yield emitted({ ...merged, sequence_number: lastSequence + 1 });
     }
 
     /**
@@ -556,6 +734,18 @@ export class CodexApiService {
         // upstream cache affinity.
         const cacheIdentity = resolveCodexCacheIdentity(cleanedBody, metadata);
 
+        // 图片请求默认显式发送 null，规避上游可能把主模型 effort 当成图片 complexity 的问题。
+        // 转换器不补默认值，因此这里仍能区分未设置与客户端显式指定的 effort。
+        // 不要仅因 tools 中存在 image_generation 就覆盖 effort：普通 Chat 也默认附带该工具。
+        let reasoningEffort = resolveCodexReasoningEffort(cleanedBody, isImageModel ? null : defaultReasoningEffort);
+        if (isFastModel && !isImageModel && reasoningEffort !== null) {
+            reasoningEffort = defaultReasoningEffort;
+        }
+        if (reasoningEffort === 'minimal') {
+            reasoningEffort = 'none';
+        }
+        delete cleanedBody.reasoning_effort;
+
         // 注意：requestBody 已经去除了 metadata
         const result = {
             ...cleanedBody,
@@ -565,7 +755,7 @@ export class CodexApiService {
             service_tier: cleanedBody.service_tier || defaultServiceTier,
             reasoning: {
                 ...cleanedBody.reasoning,
-                effort: isFastModel ? defaultReasoningEffort : (cleanedBody.reasoning?.effort === 'minimal' ? 'none' : (cleanedBody.reasoning?.effort || defaultReasoningEffort)),
+                effort: reasoningEffort,
                 summary: cleanedBody.reasoning?.summary || 'auto',
             },
             stream,
@@ -755,6 +945,19 @@ export class CodexApiService {
         const response = eventData.response || {};
         const output = response.output;
 
+        // A terminal envelope may omit a result already delivered by output_item.done.
+        // Preserve it instead of mistaking the request for a zero-result image failure.
+        if (Array.isArray(output)) {
+            const completedImages = new Map(getCodexGeneratedImages({
+                output: [...outputItemsByIndex.values(), ...outputItemsFallback]
+            }).filter(item => item.id).map(item => [item.id, item]));
+            for (const item of output) {
+                if (item.type === 'image_generation_call' && !item.result && completedImages.has(item.id)) {
+                    Object.assign(item, completedImages.get(item.id));
+                }
+            }
+        }
+
         const shouldPatch = (!output || !Array.isArray(output) || output.length === 0) &&
             (outputItemsByIndex.size > 0 || outputItemsFallback.length > 0);
 
@@ -874,6 +1077,7 @@ export class CodexApiService {
         const outputItemsFallback = [];
 
         let completedEvent = null;
+        let imageGenerationAlreadySucceeded = false;
 
         for (const line of lines) {
             const trimmedLine = line.trim();
@@ -891,6 +1095,14 @@ export class CodexApiService {
 
             try {
                 let parsed = JSON.parse(jsonData);
+                const imageOutput = parsed.type === 'response.output_item.done' ? [parsed.item] : parsed.response?.output;
+                if (Array.isArray(imageOutput) && imageOutput.some(item => item?.type === 'image_generation_call' && item.result)) {
+                    imageGenerationAlreadySucceeded = true;
+                }
+                if (Array.isArray(imageOutput) && imageOutput.some(item => item?.type === 'image_generation_call' && item.error)) {
+                    const error = createCodexTerminalError(parsed);
+                    if (error) throw error;
+                }
                 switch (parsed.type) {
                     case 'error':
                     case 'response.failed': {
@@ -924,6 +1136,7 @@ export class CodexApiService {
                 }
             } catch (e) {
                 if (e.message.startsWith('Codex API error')) {
+                    e.imageGenerationAlreadySucceeded = imageGenerationAlreadySucceeded;
                     throw e;
                 }
                 // 继续解析下一行

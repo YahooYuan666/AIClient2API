@@ -6,6 +6,7 @@ import {
     getRequestBody,
     getRateLimitCooldownRecoveryTime,
     getProtocolPrefix,
+    ensureValidStatusCode,
     MODEL_PROTOCOL_PREFIX
 } from '../utils/common.js';
 import { getProviderPoolManager, getApiServiceWithFallback } from './service-manager.js';
@@ -16,6 +17,24 @@ import { convertData } from '../convert/convert.js';
 
 const IMAGE_GEN_MAX_N = 4;
 const VALID_RESPONSE_FORMATS = new Set(['b64_json', 'url']);
+
+function getImageErrorStatus(error) {
+    const status = ensureValidStatusCode(error.response?.status || error.statusCode || error.status || 500);
+    return status >= 400 ? status : 500;
+}
+
+function sendImageError(res, error) {
+    if (res.writableEnded) return;
+
+    const status = getImageErrorStatus(error);
+    const type = status === 401 ? 'authentication_error'
+        : status === 403 ? 'permission_error'
+        : status === 429 ? 'rate_limit_error'
+        : status >= 500 ? 'server_error'
+        : 'invalid_request_error';
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: error.message, type } }));
+}
 
 /**
  * Handle API authentication and routing
@@ -128,11 +147,11 @@ async function handleImageGenerationRequest(req, res, currentConfig, providerPoo
     const CONFIG = retryContext?.CONFIG ?? currentConfig;
     let slotProviderType = null;
     let slotUuid = null;
-    let model, n, response_format, size, codexRequestBody, virtualOpenAIRequest;
+    let model, prompt, n, response_format, size, codexRequestBody, virtualOpenAIRequest;
 
     try {
         if (retryContext?.parsedBody) {
-            ({model, n, response_format, size, virtualOpenAIRequest} = retryContext.parsedBody);
+            ({model, prompt, n, response_format, size, virtualOpenAIRequest} = retryContext.parsedBody);
             codexRequestBody = virtualOpenAIRequest;
         } else {
             const body = await getRequestBody(req, { maxBytes: CONFIG.REQUEST_BODY_MAX_BYTES });
@@ -141,7 +160,7 @@ async function handleImageGenerationRequest(req, res, currentConfig, providerPoo
             size = body.size;
             // cap n：至少 1，最多 IMAGE_GEN_MAX_N，非数字降级为 1
             n = Math.min(Math.max(1, parseInt(body.n) || 1), IMAGE_GEN_MAX_N);
-            const prompt = body.prompt;
+            prompt = body.prompt;
 
             if (!SUPPORTED_IMAGE_MODELS.has(model)) {
                 res.writeHead(400, {'Content-Type': 'application/json'});
@@ -173,6 +192,8 @@ async function handleImageGenerationRequest(req, res, currentConfig, providerPoo
                 n,
                 size,
                 response_format,
+                reasoning: body.reasoning,
+                reasoning_effort: body.reasoning_effort,
                 _imageSize: size, // 兼容 Codex 内部使用的字段
                 _monitorRequestId: currentConfig._monitorRequestId // 注入监控 ID
             };
@@ -279,9 +300,12 @@ async function handleImageGenerationRequest(req, res, currentConfig, providerPoo
         logger.error('[Image Generation] Error:', error.message);
 
         const shouldSwitchCredential = error.shouldSwitchCredential === true;
+        const status = getImageErrorStatus(error);
+        // 参数错误与凭据健康无关；保留上游显式要求切号的配额错误处理。
+        const isInvalidRequest = (status === 400 || status === 422) && !shouldSwitchCredential;
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
 
-        if (providerPoolManager && slotUuid) {
+        if (!isInvalidRequest && providerPoolManager && slotUuid) {
             const quotaRecoveryTime = error?.quotaRecoveryTime instanceof Date && !Number.isNaN(error.quotaRecoveryTime.getTime())
                 ? error.quotaRecoveryTime
                 : null;
@@ -310,7 +334,7 @@ async function handleImageGenerationRequest(req, res, currentConfig, providerPoo
         }
 
         const imageQuotaHasAlternate = !error.quotaExhaustedNoRetry;
-        if (credentialMarkedUnhealthy && imageQuotaHasAlternate && currentRetry < maxRetries && providerPoolManager && CONFIG) {
+        if (!isInvalidRequest && credentialMarkedUnhealthy && imageQuotaHasAlternate && currentRetry < maxRetries && providerPoolManager && CONFIG) {
             const randomDelay = Math.floor(Math.random() * 10000);
             logger.info(`[Image Generation Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries}...`);
             await new Promise(resolve => setTimeout(resolve, randomDelay));
@@ -321,17 +345,14 @@ async function handleImageGenerationRequest(req, res, currentConfig, providerPoo
                     CONFIG,
                     currentRetry: currentRetry + 1,
                     maxRetries,
-                    parsedBody: {model, n, response_format, size, virtualOpenAIRequest}
+                    parsedBody: {model, prompt, n, response_format, size, virtualOpenAIRequest}
                 });
             } catch (retryError) {
                 logger.error('[Image Generation Retry] Failed to get alternative service:', retryError.message);
             }
         }
 
-        if (!res.writableEnded) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: { message: error.message, type: 'server_error' } }));
-        }
+        sendImageError(res, error);
     } finally {
         // 确保并发槽在请求结束后归还（与 handleStreamRequest/handleUnaryRequest 保持一致）
         if (providerPoolManager && slotProviderType && slotUuid) {
@@ -638,10 +659,7 @@ async function handleImageEditsRequest(req, res, currentConfig, providerPoolMana
         res.end(JSON.stringify(clientResponse));
     } catch (error) {
         logger.error('[Image Edits] Error:', error.message);
-        if (!res.writableEnded) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: { message: error.message, type: 'server_error' } }));
-        }
+        sendImageError(res, error);
     } finally {
         if (providerPoolManager && slotProviderType && slotUuid) {
             providerPoolManager.releaseSlot(slotProviderType, slotUuid);
